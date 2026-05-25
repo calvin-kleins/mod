@@ -1,167 +1,168 @@
 /**
- * 流媒体 & AI 服务解锁检测脚本
+ * 流媒体 & AI 服务解锁检测脚本 v2.0
  * 适用于 Surge Panel，点击即可检测当前节点解锁状态
- * 
- * 检测服务：Netflix, YouTube Premium, Disney+, Spotify,
- *           ChatGPT, Claude, TikTok, Bilibili港澳台,
- *           HBO Max, Amazon Prime Video, DAZN, TVB
+ *
+ * 检测服务（13项）：
+ *   Netflix, YouTube Premium, Disney+, Spotify,
+ *   ChatGPT, Claude, Gemini, TikTok,
+ *   Bilibili港澳台, HBO Max, Prime Video, DAZN, TVB
+ *
+ * 输出格式：Emoji + 服务名 + 状态，每行两项用 | 分隔
+ * icon-color 根据整体解锁率动态变化
  */
 
-const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+// ==================== 配置 ====================
 
-const REQUEST_HEADERS = {
+const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
+
+const HEADERS = {
   'User-Agent': UA,
   'Accept-Language': 'en',
-}
+};
 
-// 超时时间（毫秒）
-const TIMEOUT = 5000
+// 单个请求超时（毫秒）
+const TIMEOUT = 5000;
 
 // ==================== 工具函数 ====================
 
 /**
- * 超时 Promise
+ * 创建超时 Promise
  */
-function timeout(ms = TIMEOUT) {
+function timeoutPromise(ms = TIMEOUT) {
   return new Promise((_, reject) => {
-    setTimeout(() => reject('Timeout'), ms)
-  })
+    setTimeout(() => reject(new Error('TIMEOUT')), ms);
+  });
 }
 
 /**
- * 带超时的 HTTP GET 请求
+ * 带超时的 HTTP GET
  */
-function httpGet(option) {
+function httpGet(opts) {
+  if (typeof opts === 'string') opts = { url: opts };
+  if (!opts.headers) opts.headers = HEADERS;
   return Promise.race([
     new Promise((resolve, reject) => {
-      $httpClient.get(option, (error, response, data) => {
-        if (error) {
-          reject(error)
-          return
-        }
-        resolve({ response, data })
-      })
+      $httpClient.get(opts, (err, resp, body) => {
+        if (err) return reject(err);
+        resolve({ status: resp.status, headers: resp.headers, body });
+      });
     }),
-    timeout()
-  ])
+    timeoutPromise(),
+  ]);
 }
 
 /**
- * 带超时的 HTTP POST 请求
+ * 带超时的 HTTP POST
  */
-function httpPost(option) {
+function httpPost(opts) {
+  if (!opts.headers) opts.headers = HEADERS;
   return Promise.race([
     new Promise((resolve, reject) => {
-      $httpClient.post(option, (error, response, data) => {
-        if (error) {
-          reject(error)
-          return
-        }
-        resolve({ response, data })
-      })
+      $httpClient.post(opts, (err, resp, body) => {
+        if (err) return reject(err);
+        resolve({ status: resp.status, headers: resp.headers, body });
+      });
     }),
-    timeout()
-  ])
+    timeoutPromise(),
+  ]);
 }
+
+/**
+ * 安全 JSON 解析
+ */
+function safeJSON(str) {
+  try { return JSON.parse(str); } catch { return null; }
+}
+
+/**
+ * 统一结果格式 { ok: boolean, region: string }
+ */
+function ok(region) { return { ok: true, region: region || '' }; }
+function fail() { return { ok: false, region: '' }; }
+function warn() { return { ok: false, region: '⚠️' }; }
 
 // ==================== 检测函数 ====================
 
 /**
- * Netflix 检测
- * 200=全解锁(从 x-originating-url 提取地区), 403=不可用
+ * 1. Netflix
+ * 检测非自制剧，从 x-originating-url 提取地区
  */
 async function checkNetflix() {
   try {
-    const { response } = await httpGet({
+    const { status, headers } = await httpGet({
       url: 'https://www.netflix.com/title/81280792',
-      headers: REQUEST_HEADERS,
-    })
+      headers: HEADERS,
+    });
 
-    if (response.status === 403) {
-      // 尝试自制剧
-      const { response: res2 } = await httpGet({
+    if (status === 403) {
+      // 降级检测自制剧
+      const r2 = await httpGet({
         url: 'https://www.netflix.com/title/80018499',
-        headers: REQUEST_HEADERS,
-      })
-      if (res2.status === 200) {
-        let url = res2.headers['x-originating-url'] || ''
-        let region = extractNetflixRegion(url)
-        return '仅自制 ' + region
+        headers: HEADERS,
+      });
+      if (r2.status === 200) {
+        const region = extractNFRegion(r2.headers['x-originating-url']);
+        return { ok: true, region: region + ' 自制' };
       }
-      return '✗'
+      return fail();
     }
 
-    if (response.status === 200) {
-      let url = response.headers['x-originating-url'] || ''
-      let region = extractNetflixRegion(url)
-      return '✓ ' + region
+    if (status === 200 || status === 301 || status === 302) {
+      const region = extractNFRegion(headers['x-originating-url']);
+      return ok(region);
     }
-
-    return '✗'
+    return fail();
   } catch (e) {
-    return e === 'Timeout' ? '⚠️ 超时' : '✗'
+    return e.message === 'TIMEOUT' ? warn() : fail();
   }
 }
 
-function extractNetflixRegion(url) {
+function extractNFRegion(url) {
+  if (!url) return 'US';
   try {
-    let parts = url.split('/')
-    let region = parts[3] || 'US'
-    region = region.split('-')[0]
-    if (region === 'title') region = 'US'
-    return region.toUpperCase()
-  } catch {
-    return 'US'
-  }
+    const parts = url.split('/');
+    let r = parts[3] || 'US';
+    r = r.split('-')[0];
+    if (r === 'title') r = 'US';
+    return r.toUpperCase();
+  } catch { return 'US'; }
 }
 
 /**
- * YouTube Premium 检测
+ * 2. YouTube Premium
  */
 async function checkYouTube() {
   try {
-    const { response, data } = await httpGet({
+    const { status, body } = await httpGet({
       url: 'https://www.youtube.com/premium',
-      headers: REQUEST_HEADERS,
-    })
+      headers: HEADERS,
+    });
+    if (status !== 200) return fail();
+    if (body.indexOf('Premium is not available in your country') !== -1) return fail();
 
-    if (response.status !== 200) return '✗'
-
-    if (data.indexOf('Premium is not available in your country') !== -1) {
-      return '✗'
-    }
-
-    let re = /"countryCode":"(.*?)"/gm
-    let result = re.exec(data)
-    if (result && result.length === 2) {
-      return '✓ ' + result[1].toUpperCase()
-    } else if (data.indexOf('www.google.cn') !== -1) {
-      return '✓ CN'
-    }
-    return '✓ US'
+    const m = body.match(/"countryCode":"(\w{2})"/);
+    if (m) return ok(m[1].toUpperCase());
+    if (body.indexOf('www.google.cn') !== -1) return ok('CN');
+    return ok('US');
   } catch (e) {
-    return e === 'Timeout' ? '⚠️ 超时' : '✗'
+    return e.message === 'TIMEOUT' ? warn() : fail();
   }
 }
 
 /**
- * Disney+ 检测
+ * 3. Disney+
  */
 async function checkDisney() {
   try {
-    // 先检测主页是否可访问
-    const { response: homeRes, data: homeData } = await httpGet({
+    const { status, body } = await httpGet({
       url: 'https://www.disneyplus.com/',
-      headers: { 'Accept-Language': 'en', 'User-Agent': UA },
-    })
+      headers: HEADERS,
+    });
 
-    if (homeRes.status !== 200 || 
-        homeData.indexOf('Sorry, Disney+ is not available in your region.') !== -1) {
-      return '✗'
-    }
+    if (status !== 200 || body.indexOf('not available in your region') !== -1) return fail();
 
-    // GraphQL 获取位置信息
-    const { response, data } = await httpPost({
+    // GraphQL 获取地区
+    const gql = await httpPost({
       url: 'https://disney.api.edge.bamgrid.com/graph/v1/device/graphql',
       headers: {
         'Accept-Language': 'en',
@@ -175,337 +176,286 @@ async function checkDisney() {
           input: {
             applicationRuntime: 'chrome',
             attributes: {
-              browserName: 'chrome',
-              browserVersion: '120.0.0',
-              manufacturer: 'apple',
-              model: null,
-              operatingSystem: 'macintosh',
-              operatingSystemVersion: '10.15.7',
+              browserName: 'chrome', browserVersion: '125.0.0',
+              manufacturer: 'apple', model: null,
+              operatingSystem: 'macintosh', operatingSystemVersion: '10.15.7',
               osDeviceIds: [],
             },
-            deviceFamily: 'browser',
-            deviceLanguage: 'en',
-            deviceProfile: 'macosx',
+            deviceFamily: 'browser', deviceLanguage: 'en', deviceProfile: 'macosx',
           },
         },
       }),
-    })
+    });
 
-    if (response.status !== 200) return '✗'
+    if (gql.status !== 200) return fail();
+    const json = safeJSON(gql.body);
+    if (!json || json.errors) return fail();
 
-    let json = JSON.parse(data)
-    if (json?.errors) return '✗'
-
-    let sdk = json?.extensions?.sdk
+    const sdk = json?.extensions?.sdk;
     if (sdk) {
-      let countryCode = sdk.session?.location?.countryCode || ''
-      let inSupported = sdk.session?.inSupportedLocation
-      if (inSupported === false || inSupported === 'false') {
-        return '即将登陆 ' + countryCode.toUpperCase()
-      }
-      return '✓ ' + countryCode.toUpperCase()
+      const cc = sdk.session?.location?.countryCode || '';
+      if (sdk.session?.inSupportedLocation === false) return { ok: true, region: cc.toUpperCase() + '⁻' };
+      return ok(cc.toUpperCase());
     }
-
-    return '✓'
+    return ok('');
   } catch (e) {
-    return e === 'Timeout' ? '⚠️ 超时' : '✗'
+    return e.message === 'TIMEOUT' ? warn() : fail();
   }
 }
 
 /**
- * Spotify 检测
+ * 4. Spotify
  */
 async function checkSpotify() {
   try {
-    const { data } = await httpGet({
+    const { body } = await httpGet({
       url: 'https://spclient.wg.spotify.com/signup/public/v1/account',
-      headers: { 'Accept-Language': 'en', 'User-Agent': UA },
-    })
-
-    let json = JSON.parse(data)
-    let country = json.country || ''
-    if (country) {
-      return '✓ ' + country.toUpperCase()
-    }
-    return '✗'
+      headers: HEADERS,
+    });
+    const json = safeJSON(body);
+    if (json && json.country) return ok(json.country.toUpperCase());
+    return fail();
   } catch (e) {
-    return e === 'Timeout' ? '⚠️ 超时' : '✗'
+    return e.message === 'TIMEOUT' ? warn() : fail();
   }
 }
 
 /**
- * ChatGPT 检测
+ * 5. ChatGPT
  */
 async function checkChatGPT() {
   try {
-    // 使用 Cloudflare trace 检测
-    const { data } = await httpGet({
+    // CF trace 获取地区
+    const trace = await httpGet({
       url: 'https://chat.openai.com/cdn-cgi/trace',
       headers: { 'User-Agent': UA },
-    })
-
-    // 解析 trace 数据
-    let lines = data.split('\n')
-    let loc = ''
-    for (let line of lines) {
-      if (line.startsWith('loc=')) {
-        loc = line.split('=')[1]
-        break
-      }
+    });
+    let loc = '';
+    const lines = (trace.body || '').split('\n');
+    for (const line of lines) {
+      if (line.startsWith('loc=')) { loc = line.split('=')[1]; break; }
     }
 
-    // 检测 iOS API 是否可用
-    const { response } = await httpGet({
+    // 验证 API 可用性
+    const { status } = await httpGet({
       url: 'https://ios.chat.openai.com/public-api/mobile/server_status/v1',
       headers: { 'User-Agent': UA },
-    })
-
-    if (response.status === 200) {
-      return loc ? '✓ ' + loc : '✓'
-    }
-    return '✗'
+    });
+    if (status === 200) return ok(loc);
+    return fail();
   } catch (e) {
-    return e === 'Timeout' ? '⚠️ 超时' : '✗'
+    return e.message === 'TIMEOUT' ? warn() : fail();
   }
 }
 
 /**
- * Claude/Anthropic 检测
+ * 6. Claude
  */
 async function checkClaude() {
   try {
-    const { response } = await httpGet({
-      url: 'https://claude.ai/login',
-      headers: {
-        'User-Agent': UA,
-        'Accept': 'text/html,application/xhtml+xml',
-      },
-    })
-
-    // 如果能正常访问登录页面则说明可用
-    if (response.status === 200 || response.status === 302) {
-      return '✓'
-    }
-    // 403 表示地区受限
-    if (response.status === 403) {
-      return '✗'
-    }
-    return '✗'
+    const { status } = await httpGet({
+      url: 'https://claude.ai/api/auth/session',
+      headers: { 'User-Agent': UA, 'Accept': 'application/json' },
+    });
+    // 200/301/302 均视为可达
+    if (status >= 200 && status < 404) return ok('');
+    return fail();
   } catch (e) {
-    return e === 'Timeout' ? '⚠️ 超时' : '✗'
+    return e.message === 'TIMEOUT' ? warn() : fail();
   }
 }
 
 /**
- * TikTok 检测
+ * 7. Gemini (Google AI)
+ */
+async function checkGemini() {
+  try {
+    const { status, body } = await httpGet({
+      url: 'https://gemini.google.com/',
+      headers: HEADERS,
+    });
+    // 若被重定向到不支持页面或返回错误
+    if (status === 403 || status === 451) return fail();
+    if (status === 200) {
+      // 检查是否有不可用提示
+      if (body.indexOf('not available') !== -1 || body.indexOf('not supported') !== -1) {
+        return fail();
+      }
+      return ok('');
+    }
+    // 302 重定向通常表示可用（重定向到 consent 页面）
+    if (status === 302 || status === 301) return ok('');
+    return fail();
+  } catch (e) {
+    return e.message === 'TIMEOUT' ? warn() : fail();
+  }
+}
+
+/**
+ * 8. TikTok
  */
 async function checkTikTok() {
   try {
-    const { response, data } = await httpGet({
+    const { status, body } = await httpGet({
       url: 'https://www.tiktok.com/',
-      headers: {
-        'User-Agent': UA,
-        'Accept-Language': 'en',
-      },
-    })
+      headers: HEADERS,
+    });
+    if (status !== 200) return fail();
 
-    if (response.status !== 200) return '✗'
+    const m = body.match(/"region":"(\w{2})"/);
+    if (m) return ok(m[1].toUpperCase());
 
-    // 从页面内容中提取地区信息
-    let regionMatch = data.match(/"region":"(\w{2})"/)
-    if (regionMatch) {
-      return '✓ ' + regionMatch[1].toUpperCase()
-    }
+    const m2 = body.match(/region=(\w{2})/);
+    if (m2) return ok(m2[1].toUpperCase());
 
-    // 尝试从 URL 重定向中判断
-    let urlMatch = data.match(/region=(\w{2})/)
-    if (urlMatch) {
-      return '✓ ' + urlMatch[1].toUpperCase()
-    }
-
-    // 检测是否被封锁
-    if (data.indexOf('tiktok') !== -1) {
-      return '✓'
-    }
-
-    return '✗'
+    if (body.indexOf('tiktok') !== -1) return ok('');
+    return fail();
   } catch (e) {
-    return e === 'Timeout' ? '⚠️ 超时' : '✗'
+    return e.message === 'TIMEOUT' ? warn() : fail();
   }
 }
 
 /**
- * Bilibili 港澳台检测
+ * 9. Bilibili 港澳台
  */
 async function checkBilibili() {
   try {
-    const { data } = await httpGet({
+    const { body } = await httpGet({
       url: 'https://api.bilibili.com/pgc/player/web/playurl?avid=18281381&cid=29892777&qn=0&type=&otype=json&ep_id=364558&fourk=1&fnval=16',
-      headers: {
-        'User-Agent': UA,
-        'Referer': 'https://www.bilibili.com/',
-      },
-    })
-
-    let json = JSON.parse(data)
-    if (json.code === 0) {
-      return '✓ 港澳台'
-    }
-    return '✗'
+      headers: { ...HEADERS, 'Referer': 'https://www.bilibili.com/' },
+    });
+    const json = safeJSON(body);
+    if (json && json.code === 0) return ok('港澳台');
+    return fail();
   } catch (e) {
-    return e === 'Timeout' ? '⚠️ 超时' : '✗'
+    return e.message === 'TIMEOUT' ? warn() : fail();
   }
 }
 
 /**
- * HBO Max (now Max) 检测
+ * 10. HBO Max (Max)
  */
 async function checkHBO() {
   try {
-    const { response, data } = await httpGet({
+    const { status, body } = await httpGet({
       url: 'https://www.max.com/',
-      headers: {
-        'User-Agent': UA,
-        'Accept-Language': 'en',
-      },
-    })
-
-    if (response.status === 200) {
-      // 检查是否有地区限制提示
-      if (data.indexOf('not available') !== -1 || 
-          data.indexOf('not yet available') !== -1) {
-        return '✗'
-      }
-      return '✓'
+      headers: HEADERS,
+    });
+    if (status === 200) {
+      if (body.indexOf('not available') !== -1 || body.indexOf('not yet available') !== -1) return fail();
+      return ok('');
     }
-
-    // 403 表示地区不可用
-    if (response.status === 403) return '✗'
-    return '✗'
+    if (status === 403) return fail();
+    return fail();
   } catch (e) {
-    return e === 'Timeout' ? '⚠️ 超时' : '✗'
+    return e.message === 'TIMEOUT' ? warn() : fail();
   }
 }
 
 /**
- * Amazon Prime Video 检测
+ * 11. Prime Video
  */
 async function checkPrimeVideo() {
   try {
-    const { response, data } = await httpGet({
+    const { status, body } = await httpGet({
       url: 'https://www.primevideo.com/',
-      headers: {
-        'User-Agent': UA,
-        'Accept-Language': 'en',
-      },
-    })
+      headers: HEADERS,
+    });
+    if (status !== 200) return fail();
 
-    if (response.status !== 200) return '✗'
+    const m = body.match(/"currentTerritory":"(\w{2})"/);
+    if (m) return ok(m[1].toUpperCase());
 
-    // 从页面中提取当前市场地区
-    let regionMatch = data.match(/"currentTerritory":"(\w{2})"/)
-    if (regionMatch) {
-      return '✓ ' + regionMatch[1].toUpperCase()
-    }
+    const m2 = body.match(/"marketplace":"(\w{2})"/);
+    if (m2) return ok(m2[1].toUpperCase());
 
-    // 尝试备用匹配
-    let marketMatch = data.match(/"marketplace":"(\w{2})"/)
-    if (marketMatch) {
-      return '✓ ' + marketMatch[1].toUpperCase()
-    }
-
-    if (data.indexOf('primevideo') !== -1) {
-      return '✓'
-    }
-
-    return '✗'
+    if (body.indexOf('primevideo') !== -1) return ok('');
+    return fail();
   } catch (e) {
-    return e === 'Timeout' ? '⚠️ 超时' : '✗'
+    return e.message === 'TIMEOUT' ? warn() : fail();
   }
 }
 
 /**
- * DAZN 检测
+ * 12. DAZN
  */
 async function checkDAZN() {
   try {
-    const { response, data } = await httpGet({
+    const { status } = await httpGet({
       url: 'https://startup.core.indazn.com/misl/v5/Ede',
-      headers: {
-        'User-Agent': UA,
-        'Content-Type': 'application/json',
-      },
-    })
-
-    // DAZN 使用 Geo 检测
-    if (response.status === 200) {
-      return '✓'
-    }
-
-    // 尝试备用检测
-    const { response: res2 } = await httpGet({
-      url: 'https://www.dazn.com/',
-      headers: { 'User-Agent': UA },
-    })
-
-    if (res2.status === 200) {
-      return '✓'
-    }
-    return '✗'
+      headers: { 'User-Agent': UA, 'Content-Type': 'application/json' },
+    });
+    if (status === 200) return ok('');
+    return fail();
   } catch (e) {
-    return e === 'Timeout' ? '⚠️ 超时' : '✗'
+    return e.message === 'TIMEOUT' ? warn() : fail();
   }
 }
 
 /**
- * TVB 检测
+ * 13. TVB (myTV SUPER)
  */
 async function checkTVB() {
   try {
-    const { response, data } = await httpGet({
+    const { status, body } = await httpGet({
       url: 'https://www.mytvsuper.com/iptest.php',
-      headers: {
-        'User-Agent': UA,
-        'Accept-Language': 'en',
-      },
-    })
-
-    if (response.status === 200) {
-      // 检测返回内容判断是否在支持地区
-      let json = JSON.parse(data)
-      if (json.country === 'HK' || json.region === 'HK') {
-        return '✓'
+      headers: HEADERS,
+    });
+    if (status === 200) {
+      const json = safeJSON(body);
+      if (json) {
+        if (json.country === 'HK' || json.region === 'HK') return ok('');
       }
-      // 有些返回格式不同，只要能访问就尝试判断
-      if (data.indexOf('HK') !== -1) {
-        return '✓'
-      }
-      return '✗'
+      if (body.indexOf('HK') !== -1) return ok('');
+      return fail();
     }
-    return '✗'
+    return fail();
   } catch (e) {
-    // TVB 可能返回非 JSON，尝试简单判断
-    if (typeof e === 'string' && e === 'Timeout') return '⚠️ 超时'
-    return '✗'
+    return e.message === 'TIMEOUT' ? warn() : fail();
   }
+}
+
+// ==================== 格式化输出 ====================
+
+/**
+ * 将检测结果格式化为单个服务的展示文本
+ */
+function fmtService(emoji, name, result) {
+  if (result.region === '⚠️') return `${emoji} ${name}: ⚠️`;
+  if (!result.ok) return `${emoji} ${name}: ✗`;
+  return `${emoji} ${name}: ✓${result.region ? ' ' + result.region : ''}`;
+}
+
+/**
+ * 根据解锁率计算 icon-color
+ */
+function calcIconColor(results) {
+  const total = results.length;
+  const success = results.filter(r => r.ok).length;
+  const ratio = success / total;
+  if (ratio >= 0.8) return '#06D6A0'; // 绿 — 大部分解锁
+  if (ratio >= 0.5) return '#FFD166'; // 黄 — 部分解锁
+  return '#EF476F';                   // 红 — 多数失败
 }
 
 // ==================== 主逻辑 ====================
 
 ;(async () => {
-  let panel_result = {
-    title: '流媒体解锁检测',
+  const startTime = Date.now();
+
+  const panel = {
+    title: '流媒体 & AI 解锁检测',
     content: '',
     icon: 'play.tv.fill',
-    'icon-color': '#FF2D55',
-  }
+    'icon-color': '#EF476F',
+  };
 
   try {
-    // 并发执行所有检测
+    // 并发检测所有服务
     const [
       netflix, youtube, disney, spotify,
-      chatgpt, claude, tiktok, bilibili,
-      hbo, prime, dazn, tvb
+      chatgpt, claude, gemini, tiktok,
+      bilibili, hbo, prime, dazn, tvb,
     ] = await Promise.all([
       checkNetflix(),
       checkYouTube(),
@@ -513,28 +463,38 @@ async function checkTVB() {
       checkSpotify(),
       checkChatGPT(),
       checkClaude(),
+      checkGemini(),
       checkTikTok(),
       checkBilibili(),
       checkHBO(),
       checkPrimeVideo(),
       checkDAZN(),
       checkTVB(),
-    ])
+    ]);
 
-    // 格式化输出，每行两个服务用 | 分隔
-    let lines = [
-      `Netflix: ${netflix} | YouTube: ${youtube}`,
-      `Disney+: ${disney} | Spotify: ${spotify}`,
-      `ChatGPT: ${chatgpt} | Claude: ${claude}`,
-      `TikTok: ${tiktok} | HBO: ${hbo}`,
-      `Bilibili: ${bilibili} | Prime: ${prime}`,
-      `DAZN: ${dazn} | TVB: ${tvb}`,
-    ]
+    const results = [netflix, youtube, disney, spotify, chatgpt, claude, gemini, tiktok, bilibili, hbo, prime, dazn, tvb];
 
-    panel_result.content = lines.join('\n')
+    // 动态 icon-color
+    panel['icon-color'] = calcIconColor(results);
+
+    // 计算耗时
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
+    // 格式化输出 — 每行两个服务
+    const lines = [
+      `${fmtService('▶️', 'Netflix', netflix)} | ${fmtService('🎬', 'Disney+', disney)}`,
+      `${fmtService('📺', 'YouTube', youtube)} | ${fmtService('🎵', 'Spotify', spotify)}`,
+      `${fmtService('🤖', 'ChatGPT', chatgpt)} | ${fmtService('🧠', 'Claude', claude)}`,
+      `${fmtService('💎', 'Gemini', gemini)} | ${fmtService('📱', 'TikTok', tiktok)}`,
+      `${fmtService('📡', 'TVB', tvb)} | ${fmtService('🎮', 'DAZN', dazn)}`,
+      `${fmtService('🅱️', 'Bilibili', bilibili)} | ${fmtService('🎥', 'HBO', hbo)}`,
+      `${fmtService('🛒', 'Prime', prime)} | ⏱ ${elapsed}s`,
+    ];
+
+    panel.content = lines.join('\n');
   } catch (e) {
-    panel_result.content = '检测失败: ' + (e.message || e)
+    panel.content = '❌ 检测异常: ' + (e.message || String(e));
   }
 
-  $done(panel_result)
-})()
+  $done(panel);
+})();
