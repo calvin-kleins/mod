@@ -1,0 +1,9 @@
+#!name=流媒体解锁检测
+#!desc=一键检测当前节点的流媒体和AI服务解锁状态
+#!homepage=https://github.com/lmc999/RegionRestrictionCheck
+
+[Panel]
+流媒体检测 = script-name=流媒体检测,update-interval=3600
+
+[Script]
+流媒体检测 = type=generic,timeout=30,script-path=https://raw.githubusercontent.com/calvin-kleins/mod/refs/heads/main/media_check.js
