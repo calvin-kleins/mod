@@ -1,9 +1,13 @@
-#!name=流媒体解锁检测
-#!desc=一键检测当前节点的流媒体和AI服务解锁状态
-#!homepage=https://github.com/lmc999/RegionRestrictionCheck
+#!name=流媒体 & AI 解锁检测
+#!desc=一键检测当前节点的流媒体和AI服务解锁状态（Netflix/YouTube/Disney+/Spotify/ChatGPT/Claude/Gemini/TikTok/Bilibili/HBO/Prime/DAZN/TVB）
+#!homepage=https://github.com/calvin-kleins/mod
+#!category=Panel
+#!arguments=timeout:30
+#!arguments-desc=timeout: 脚本最大执行时间(秒)
+#!requirement=CORE_VERSION>=20
 
 [Panel]
-流媒体检测 = script-name=流媒体检测,update-interval=3600
+流媒体检测 = script-name=流媒体检测,update-interval=3600,icon=play.tv.fill,icon-color=#06D6A0
 
 [Script]
-流媒体检测 = type=generic,timeout=30,script-path=https://raw.githubusercontent.com/calvin-kleins/mod/refs/heads/main/media_check.js
+流媒体检测 = type=generic,timeout=%timeout%,script-path=https://raw.githubusercontent.com/calvin-kleins/mod/refs/heads/main/media_check.js
