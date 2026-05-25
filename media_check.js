@@ -151,9 +151,9 @@ async function TVB() {
 // ─── Render ─────────────────────────────────────
 
 const fmt = (name, r) => {
-  if (r[0] === -1) return `${name} ⚠️`;
-  if (r[0] === 0)  return `${name} ✗`;
-  return r[1] ? `${name} ✓ ${r[1]}` : `${name} ✓`;
+  if (r[0] === -1) return `${name} \u26a0\ufe0f`;
+  if (r[0] === 0)  return `${name} \u2717`;
+  return r[1] ? `${name} \u2713${r[1]}` : `${name} \u2713`;
 };
 
 ;(async () => {
@@ -175,10 +175,10 @@ const fmt = (name, r) => {
     const sec = ((Date.now() - t0) / 1000).toFixed(1);
 
     panel.content = [
-      `${fmt('NF', nf)} · ${fmt('YT', yt)} · ${fmt('D+', dp)} · ${fmt('SP', sp)}`,
-      `${fmt('HBO', hbo)} · ${fmt('Prime', pm)} · ${fmt('DAZN', dz)} · ${fmt('TVB', tvb)}`,
-      `${fmt('GPT', gpt)} · ${fmt('Claude', cl)} · ${fmt('Gemini', gm)}`,
-      `${fmt('TikTok', tt)} · ${fmt('Bili', bl)} ── ${ok}/${all.length} · ${sec}s`,
+      `${fmt('NF', nf)} \u00b7 ${fmt('YT', yt)} \u00b7 ${fmt('D+', dp)} \u00b7 ${fmt('SP', sp)}`,
+      `${fmt('HBO', hbo)} \u00b7 ${fmt('Prime', pm)} \u00b7 ${fmt('DAZN', dz)}`,
+      `${fmt('GPT', gpt)} \u00b7 ${fmt('Claude', cl)} \u00b7 ${fmt('Gemini', gm)}`,
+      `${fmt('TikTok', tt)} \u00b7 ${fmt('Bili', bl)} \u00b7 ${fmt('TVB', tvb)} \u2502 ${ok}/${all.length} ${sec}s`,
     ].join('\n');
   } catch (e) {
     panel.content = '✗ ' + (e.message || e);
