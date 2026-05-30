@@ -1,8 +1,8 @@
 #!name=Smart 自动优选
 #!desc=解锁检测+测速+自动更新Smart组权重
 #!version=1.0.0
-#!arguments=token:GH_TOKEN, gist_id:GIST_ID, dry_run:true
-#!arguments-desc=token: GitHub Personal Access Token 用于 Gist 同步\ngist_id: Gist ID 用于配置托管\ndry_run: 调试模式（true/false）跳过 Gist 上传和 Profile 重载
+#!arguments=token:GH_TOKEN, gist_id:GIST_ID, dry_run:false
+#!arguments-desc=token: GitHub Personal Access Token\ngist_id: Gist ID\ndry_run: 调试模式（true/false）
 
 [Script]
 smart_selector = type=generic, timeout=300, script-path=https://raw.githubusercontent.com/calvin-kleins/mod/refs/heads/main/smart_selector.js, argument=token={{{token}}}&gist_id={{{gist_id}}}&dry_run={{{dry_run}}}
