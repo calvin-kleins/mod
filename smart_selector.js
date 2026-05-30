@@ -652,7 +652,8 @@ function updateProfileWeights(profileText, weightMap) {
     if (!line || line.startsWith("#") || line.startsWith("//")) continue;
     
     // 检查是否是 smart 类型的组
-    if (!/type\s*=\s*smart/i.test(line)) continue;
+    // Surge 配置格式: "GroupName = smart, ..."（smart 紧跟在 = 后面，非 type=smart 参数）
+    if (!/=\s*smart\b/i.test(line)) continue;
     
     // 匹配该 Smart 组的地区
     const region = matchSmartGroupRegion(line);
@@ -909,12 +910,13 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
     
     // 4. 对每个地区执行解锁检测和测速（通过 Smart 组级路由）
     const regionResults = {};
+    
+    // 预处理：映射延迟数据到各地区节点
+    const regionLatencies = {};
     for (const [region, data] of Object.entries(regionData)) {
       if (data.nodes.length === 0) continue;
-      const smartGroupName = data.smartGroup;
-      
-      // 映射延迟到该地区节点（通过 lineHash）
       const nodeLatencies = mapBenchmarkToNodes(benchmarkData, data.hashMap);
+      regionLatencies[region] = nodeLatencies;
       log("debug", "Main", `${region} 延迟映射`, { mapped: Object.keys(nodeLatencies).length, total: data.nodes.length });
       
       // 更新历史中的延迟 EMA
@@ -923,10 +925,29 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
           history.nodes[name].emaLatency = updateEMA(history.nodes[name].emaLatency, lat);
         }
       }
-      
-      // 地区级解锁检测
-      const unlockResult = await checkRegionUnlock(region, smartGroupName);
-      log("info", "Unlock", `${region} 解锁检测`, { score: unlockResult.unlockScore, details: unlockResult.details });
+    }
+    
+    // 阶段1：所有地区的解锁检测并行执行（各地区走不同代理节点，互不影响）
+    const activeRegionEntries = Object.entries(regionData).filter(([_, data]) => data.nodes.length > 0);
+    const unlockResults = await Promise.all(
+      activeRegionEntries.map(async ([region, data]) => {
+        const unlockResult = await checkRegionUnlock(region, data.smartGroup);
+        log("info", "Unlock", `${region} 解锁检测`, { score: unlockResult.unlockScore, details: unlockResult.details });
+        return { region, unlockResult };
+      })
+    );
+    
+    // 构建解锁结果映射：region -> unlockResult
+    const unlockMap = {};
+    for (const { region, unlockResult } of unlockResults) {
+      unlockMap[region] = unlockResult;
+    }
+    
+    // 阶段2：测速串行执行（避免带宽互相干扰）
+    for (const [region, data] of activeRegionEntries) {
+      const smartGroupName = data.smartGroup;
+      const nodeLatencies = regionLatencies[region];
+      const unlockResult = unlockMap[region];
       
       // 地区级测速
       const speedResult = await testRegionSpeed(region, smartGroupName);
