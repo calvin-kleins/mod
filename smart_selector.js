@@ -26,7 +26,6 @@ const CONFIG = {
   DRY_RUN: (args.dry_run || $persistentStore.read("smart_selector_dry_run") || "false") === "true",
   GITHUB_TOKEN: args.token || $persistentStore.read("smart_selector_github_token") || "",
   GIST_ID: args.gist_id || $persistentStore.read("smart_selector_gist_id") || "",
-  GIST_FILENAME: null,  // 自动从 Gist API 发现（优先 .conf 文件）
   CONCURRENCY: 3,
   SPEED_TIMEOUT: 10000,
   UNLOCK_TIMEOUT: 5000,
