@@ -26,7 +26,7 @@ const CONFIG = {
   DRY_RUN: (args.dry_run || $persistentStore.read("smart_selector_dry_run") || "false") === "true",
   GITHUB_TOKEN: args.token || $persistentStore.read("smart_selector_github_token") || "",
   GIST_ID: args.gist_id || $persistentStore.read("smart_selector_gist_id") || "",
-  GIST_FILENAME: "surge.conf",
+  GIST_FILENAME: null,  // 自动从 Gist API 发现（优先 .conf 文件）
   CONCURRENCY: 3,
   SPEED_TIMEOUT: 10000,
   UNLOCK_TIMEOUT: 5000,
@@ -308,11 +308,11 @@ async function checkRegionUnlock(region, smartGroupName) {
 // ==================== 测速模块 ====================
 
 const SPEED_TEST_FILES = {
-  HK: { url: "http://speedtest.hk.chinamobile.com/2MB.test", size: 2097152 },
+  HK: { url: "http://cachefly.cachefly.net/2mb.test", size: 2097152 },
   TW: { url: "http://cachefly.cachefly.net/2mb.test", size: 2097152 },
-  JP: { url: "http://speed.hetzner.de/1MB.bin", size: 1048576 },
-  SG: { url: "http://speedtest.sg.chinamobile.com/2MB.test", size: 2097152 },
-  US: { url: "http://speed.hetzner.de/1MB.bin", size: 1048576 },
+  JP: { url: "http://cachefly.cachefly.net/2mb.test", size: 2097152 },
+  SG: { url: "http://cachefly.cachefly.net/2mb.test", size: 2097152 },
+  US: { url: "http://cachefly.cachefly.net/2mb.test", size: 2097152 },
   DEFAULT: { url: "http://cachefly.cachefly.net/2mb.test", size: 2097152 }
 };
 
@@ -682,6 +682,20 @@ function updateProfileWeights(profileText, weightMap) {
 
 // ==================== Gist 同步模块 ====================
 
+// 模块级变量：存储从 Gist API 自动发现的文件名
+let _discoveredGistFilename = null;
+
+// 从 Gist API 响应中自动发现配置文件名
+// 优先选 .conf 结尾的文件，否则取第一个文件
+function discoverGistFilename(files) {
+  const filenames = Object.keys(files);
+  if (filenames.length === 0) throw new Error("Gist 中无任何文件");
+  const confFile = filenames.find(f => f.endsWith('.conf'));
+  const selected = confFile || filenames[0];
+  log("info", "Gist", "自动发现文件名", { selected, total: filenames.length });
+  return selected;
+}
+
 // 从 Gist 下载当前 Profile
 async function downloadProfile() {
   log("info", "Gist", "Profile 下载开始");
@@ -702,10 +716,10 @@ async function downloadProfile() {
   }
   
   const gistData = JSON.parse(resp.body);
-  const file = gistData.files[CONFIG.GIST_FILENAME];
-  if (!file) {
-    throw new Error(`File ${CONFIG.GIST_FILENAME} not found in Gist`);
-  }
+  
+  // 自动从 Gist 元数据中发现文件名
+  _discoveredGistFilename = discoverGistFilename(gistData.files);
+  const file = gistData.files[_discoveredGistFilename];
   
   // 如果文件太大，需要通过 raw_url 获取
   if (file.truncated) {
@@ -714,17 +728,20 @@ async function downloadProfile() {
       policy: CONFIG.PROXY_POLICY,
       timeout: 15000
     });
-    log("info", "Gist", "Profile 下载完成 (truncated, via raw_url)");
+    log("info", "Gist", "Profile 下载完成 (truncated, via raw_url)", { filename: _discoveredGistFilename });
     return rawResp.body;
   }
   
-  log("info", "Gist", "Profile 下载完成");
+  log("info", "Gist", "Profile 下载完成", { filename: _discoveredGistFilename });
   return file.content;
 }
 
-// 上传更新后的 Profile 到 Gist
+// 上传更新后的 Profile 到 Gist（使用下载时自动发现的文件名）
 async function uploadProfile(content) {
-  log("info", "Gist", "Profile 上传开始");
+  if (!_discoveredGistFilename) {
+    throw new Error("未发现 Gist 文件名，请先执行 downloadProfile");
+  }
+  log("info", "Gist", "Profile 上传开始", { filename: _discoveredGistFilename });
   const resp = await httpPatch({
     url: `https://api.github.com/gists/${CONFIG.GIST_ID}`,
     headers: {
@@ -735,7 +752,7 @@ async function uploadProfile(content) {
     },
     body: JSON.stringify({
       files: {
-        [CONFIG.GIST_FILENAME]: { content }
+        [_discoveredGistFilename]: { content }
       }
     }),
     policy: CONFIG.PROXY_POLICY,
@@ -746,7 +763,7 @@ async function uploadProfile(content) {
     log("error", "Gist", "Profile 上传失败", { status: resp.status });
     throw new Error(`Gist upload failed: HTTP ${resp.status}`);
   }
-  log("info", "Gist", "Profile 上传完成");
+  log("info", "Gist", "Profile 上传完成", { filename: _discoveredGistFilename });
   return true;
 }
 
