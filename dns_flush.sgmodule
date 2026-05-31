@@ -1,6 +1,5 @@
 #!name=DNS 缓存刷新
 #!desc=按需/网络切换/定时自动刷新DNS缓存
-#!system=mac
 #!version=2.0.0
 #!homepage=https://github.com/calvin-kleins/mod
 #!category=CalvinKleins
