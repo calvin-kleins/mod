@@ -345,6 +345,14 @@ const SPEED_TEST_FILES = {
   DEFAULT: { url: "http://cachefly.cachefly.net/2mb.test", size: 2097152 }
 };
 
+// 流媒体专用测速文件（uhdnow.com 视频资源）
+const STREAMING_TEST_FILE = {
+  url: "https://www.uhdnow.com/landing/hero-prism.mp4",
+  // 文件大小未知，用下载时间+实际接收字节计算速率
+  // 超时设为 15 秒（视频文件可能较大）
+  timeout: 15000
+};
+
 // 测试指定地区的下载速率（通过 Smart 组路由）
 // 返回 { speedBps: number (bytes/s), elapsed: number (s) } 或 null（超时/失败）
 async function testRegionSpeed(region, smartGroupName) {
@@ -364,6 +372,33 @@ async function testRegionSpeed(region, smartGroupName) {
     return { speedBps, elapsed };
   } catch (e) {
     log("warn", "Speed", `${region} (${smartGroupName}) 测速失败`, { error: e.message });
+    return null;
+  }
+}
+
+// 测试指定地区到流媒体站点的下载速率
+// 返回 { speedBps: number, elapsed: number } 或 null
+async function testStreamingSpeed(region, smartGroupName) {
+  try {
+    const startTime = Date.now();
+    const resp = await httpGet({
+      url: STREAMING_TEST_FILE.url,
+      policy: smartGroupName,
+      timeout: STREAMING_TEST_FILE.timeout || 15000,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Range": "bytes=0-2097151"  // 只下载前 2MB，避免文件太大
+      }
+    });
+    const elapsed = (Date.now() - startTime) / 1000;
+    // 用响应体长度计算速率（Range 请求返回实际字节数）
+    const bytes = resp.body ? resp.body.length : 0;
+    if (bytes === 0) return null;
+    const speedBps = bytes / elapsed;
+    log("info", "Stream", `${region} 流媒体测速`, { speedMbps: (speedBps * 8 / 1048576).toFixed(2), bytes, elapsed: elapsed.toFixed(2) });
+    return { speedBps, elapsed };
+  } catch (e) {
+    log("warn", "Stream", `${region} 流媒体测速失败`, { error: e.message });
     return null;
   }
 }
@@ -661,6 +696,22 @@ function generateWeightsFromModel(history, regional, currentNetworkType) {
 
 // ==================== 权重工具 ====================
 
+// 查找真正的内联注释位置（排除 URL 中的 // 和引号内的 //）
+// Surge 内联注释格式: 配置内容后跟 " //注释" 或 ", //注释"
+function findCommentIndex(line) {
+  let inQuotes = false;
+  for (let j = 0; j < line.length - 1; j++) {
+    if (line[j] === '"') { inQuotes = !inQuotes; continue; }
+    if (inQuotes) continue;
+    if (line[j] === '/' && line[j + 1] === '/') {
+      // 排除 URL 中的 :// (如 https:// http://)
+      if (j > 0 && line[j - 1] === ':') continue;
+      return j;
+    }
+  }
+  return -1;
+}
+
 // 数值映射工具
 function mapRange(value, inMin, inMax, outMin, outMax) {
   if (inMax === inMin) return (outMin + outMax) / 2;
@@ -703,10 +754,13 @@ function calculateWeight(unlockScore, speedBps, latencyMs, maxSpeedInGroup) {
 
 // ==================== Profile 更新模块 ====================
 
-// 匹配 Smart 组所属地区
+// 匹配 Smart 组所属地区（仅匹配组名，避免 URL/参数中的误匹配）
 function matchSmartGroupRegion(groupLine) {
+  const nameMatch = groupLine.match(/^\s*([^=]+?)\s*=/);
+  if (!nameMatch) return null;
+  const groupName = nameMatch[1];
   for (const [region, pattern] of Object.entries(CONFIG.REGION_PATTERNS)) {
-    if (pattern.test(groupLine)) return region;
+    if (pattern.test(groupName)) return region;
   }
   return null;
 }
@@ -770,13 +824,13 @@ function updateProfileWeights(profileText, weightMap, suffix, regionScores, netw
       lines[i] = lines[i].replace(/policy-priority\s*=\s*"[^"]*"/, priorityValue);
     } else {
       // 没有，在行末追加（逗号分隔），注意避开内联注释
-      const commentIdx = lines[i].indexOf("//");
+      const commentIdx = findCommentIndex(lines[i]);
       if (commentIdx > 0) {
-        const configPart = lines[i].substring(0, commentIdx).replace(/\s*$/, "");
+        const configPart = lines[i].substring(0, commentIdx).trimEnd();
         const commentPart = lines[i].substring(commentIdx);
         lines[i] = `${configPart}, ${priorityValue} ${commentPart}`;
       } else {
-        lines[i] = lines[i].replace(/\s*$/, `, ${priorityValue}`);
+        lines[i] = lines[i].trimEnd() + `, ${priorityValue}`;
       }
     }
     
@@ -811,12 +865,15 @@ const FALLBACK_REORDER_CONFIG = {
 // maxSpeedMbps: 本轮所有地区中的最大速度，用于相对归一化
 function calcRegionScore(regionData, sortBy, minSpeedMbps, maxSpeedMbps) {
   const unlock = regionData.unlock || 0;          // 0-1
-  const speed = regionData.speedMbps || 0;         // Mbps
+  // 对于 unlock 排序模式（流媒体/Netflix容灾），优先用流媒体测速结果
+  const speed = (sortBy === "unlock" && regionData.streamingSpeedMbps > 0)
+    ? regionData.streamingSpeedMbps
+    : (regionData.speedMbps || 0);
   const latency = regionData.latencyMs || 999;     // ms
   
-  // min-max 归一化
+  // min-max 归一化（clamp 防止流媒体速度超出范围）
   const speedRange = maxSpeedMbps - minSpeedMbps;
-  const speedNorm = speedRange > 0 ? (speed - minSpeedMbps) / speedRange : 0.5;
+  const speedNorm = speedRange > 0 ? Math.min(Math.max((speed - minSpeedMbps) / speedRange, 0), 1) : 0.5;
   const latencyNorm = 1 - Math.min(latency / 500, 1);    // 500ms 零分
   
   if (sortBy === "latency") {
@@ -869,8 +926,16 @@ function reorderFallbackGroups(profileText, regionScores, unlockDetails, minSpee
     
     // 解析 Fallback 行
     // 格式: 组名 = fallback, 地区1, 地区2, ..., 自动选优/DIRECT, url=..., interval=...
-    const eqIndex = lines[i].indexOf("=");
-    const afterEq = lines[i].substring(eqIndex + 1).trim();
+    // 先分离可能存在的内联注释
+    const commentIdx = findCommentIndex(lines[i]);
+    let inlineComment = "";
+    let workLine = lines[i];
+    if (commentIdx > 0) {
+      inlineComment = " " + lines[i].substring(commentIdx);
+      workLine = lines[i].substring(0, commentIdx).trimEnd();
+    }
+    const eqIndex = workLine.indexOf("=");
+    const afterEq = workLine.substring(eqIndex + 1).trim();
     
     // 分离参数部分（url=, interval=, timeout=, evaluate-before-use=, hidden=, icon-url= 等）
     const parts = afterEq.split(",").map(p => p.trim());
@@ -970,8 +1035,8 @@ function reorderFallbackGroups(profileText, regionScores, unlockDetails, minSpee
     }
     
     // 重组行
-    const prefix = lines[i].substring(0, eqIndex + 1);
-    const newLine = `${prefix} ${policyType}, ${newMembers.join(", ")}${params.length > 0 ? ", " + params.join(", ") : ""}`;
+    const prefix = workLine.substring(0, eqIndex + 1);
+    const newLine = `${prefix} ${policyType}, ${newMembers.join(", ")}${params.length > 0 ? ", " + params.join(", ") : ""}${inlineComment}`;
     lines[i] = newLine;
     
     // 在重排行上方插入/更新 SmartSelector 注释
@@ -1273,6 +1338,42 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
       }
     }
     
+    // 阶段3：流媒体专项测速（串行，用于流媒体容灾排序）
+    log("info", "Main", "开始流媒体专项测速");
+    const streamingResults = {};
+    for (const [region, data] of activeRegionEntries) {
+      const streamResult = await testStreamingSpeed(region, data.smartGroup);
+      streamingResults[region] = streamResult;
+    }
+    log("info", "Stream", "流媒体测速完成", {
+      results: Object.entries(streamingResults).map(([r, s]) =>
+        `${r}:${s ? (s.speedBps * 8 / 1048576).toFixed(1) + "Mbps" : "失败"}`
+      ).join(", ")
+    });
+    
+    // 融合流媒体测速到节点速度评估（流媒体占40%，通用测速占60%）
+    for (const [region, data] of activeRegionEntries) {
+      if (streamingResults[region] && regionResults[region]) {
+        const streamSpeed = streamingResults[region].speedBps;
+        const regionResult = regionResults[region];
+        const hasGenericSpeed = regionResult.length > 0 && regionResult[0].speedBps > 0;
+        const blendedSpeed = hasGenericSpeed
+          ? regionResult[0].speedBps * 0.6 + streamSpeed * 0.4
+          : streamSpeed;
+        for (const result of regionResult) {
+          result.speedBps = blendedSpeed;
+        }
+        // 用混合速度重新更新节点历史的 emaSpeed
+        for (const result of regionResult) {
+          if (history.nodes[result.proxyName]) {
+            history.nodes[result.proxyName].emaSpeed = updateEMA(
+              history.nodes[result.proxyName].emaSpeed, blendedSpeed, 0.3
+            );
+          }
+        }
+      }
+    }
+    
     // 5. 重新计算所有节点的综合评分
     recalculateAllScores(history);
     
@@ -1296,7 +1397,10 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
       regionScores[region] = {
         unlock: unlockResult ? unlockResult.unlockScore : 0,
         speedMbps: speedMbps,
-        latencyMs: avgLatency
+        latencyMs: avgLatency,
+        streamingSpeedMbps: streamingResults[region]
+          ? (streamingResults[region].speedBps * 8) / 1048576
+          : 0
       };
     }
     // 计算本轮 min/max
