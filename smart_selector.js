@@ -642,6 +642,12 @@ function generateWeightsFromModel(history, regional, currentNetworkType) {
       weight: Math.max(Math.min(w.weight, avgWeight * MAX_WEIGHT_RATIO), MIN_WEIGHT)
     }));
     
+    // 1.3 归一化：让平均值 = 1.0（weight < 1 提优，> 1 降优）
+    const finalAvg = weights.reduce((s, w) => s + w.weight, 0) / weights.length;
+    if (finalAvg > 0) {
+      weights = weights.map(w => ({ name: w.name, weight: w.weight / finalAvg }));
+    }
+    
     // 保存本轮权重供下次 EMA 使用
     for (const w of weights) {
       newRegionWeights[w.name] = w.weight;
