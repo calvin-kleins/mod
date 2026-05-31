@@ -2,13 +2,15 @@
 #!desc=按需/网络切换/定时自动刷新DNS缓存
 #!system=mac
 #!version=2.0.0
+#!homepage=https://github.com/calvin-kleins/mod
+#!category=CalvinKleins
 #!arguments=log_level:INFO,min_interval:300
 #!arguments-desc=参数说明：\n  log_level: 日志级别 (DEBUG/INFO/WARN/ERROR)，默认 INFO\n  min_interval: 最小刷新间隔 (秒)，默认 300
 
 [Script]
-dns_flush = type=generic, timeout=30, script-path=dns_flush.js, argument=log_level={{{log_level}}}&min_interval={{{min_interval}}}
-dns_flush_network = type=event, event-name=network-changed, timeout=30, script-path=dns_flush.js, argument=log_level={{{log_level}}}&min_interval={{{min_interval}}}
-dns_flush_cron = type=cron, cronexp="*/10 * * * *", timeout=30, script-path=dns_flush.js, argument=log_level={{{log_level}}}&min_interval={{{min_interval}}}
+dns_flush = type=generic, timeout=30, script-path=https://raw.githubusercontent.com/calvin-kleins/mod/refs/heads/main/dns_flush.js, argument=log_level={{{log_level}}}&min_interval={{{min_interval}}}
+dns_flush_network = type=event, event-name=network-changed, timeout=30, script-path=https://raw.githubusercontent.com/calvin-kleins/mod/refs/heads/main/dns_flush.js, argument=log_level={{{log_level}}}&min_interval={{{min_interval}}}
+dns_flush_cron = type=cron, cronexp="*/10 * * * *", timeout=30, script-path=https://raw.githubusercontent.com/calvin-kleins/mod/refs/heads/main/dns_flush.js, argument=log_level={{{log_level}}}&min_interval={{{min_interval}}}
 
 [Panel]
 DNS刷新 = script-name=dns_flush, timeout=30, update-interval=0
