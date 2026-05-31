@@ -1,6 +1,8 @@
 #!name=Smart 自动优选
 #!desc=解锁检测+测速+自动更新Smart组权重
 #!version=1.0.0
+#!homepage=https://github.com/calvin-kleins/mod
+#!category=CalvinKleins
 #!arguments=token:GH_TOKEN, gist_id:GIST_ID, dry_run:false
 #!arguments-desc=token: GitHub Personal Access Token\ngist_id: Gist ID\ndry_run: 调试模式（true/false）
 
