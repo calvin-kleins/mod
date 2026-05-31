@@ -1,6 +1,6 @@
 /*
- * DNS 缓存智能刷新 - Surge Script
- * 功能: 按需/网络切换/智能策略 自动刷新 DNS 缓存
+ * DNS 缓存刷新 - Surge Script
+ * 功能: 按需/网络切换/定时 自动刷新 DNS 缓存
  * 运行环境: Surge Script Engine (type=generic/event/cron)
  */
 
@@ -23,31 +23,15 @@ const args = (() => {
 
 // ==================== 配置常量 ====================
 const CONFIG = {
-  // 智能刷新策略参数（支持 sgmodule argument 覆盖）
-  PROBE_TIMEOUT: 3000,           // 探测超时 (ms)
-  LATENCY_THRESHOLD: parseInt(args.latency_threshold) || 500,  // 解析时间阈值 (ms)
-  FAIL_COUNT_THRESHOLD: 3,       // 连续失败次数阈值，达到立即刷新
   MIN_FLUSH_INTERVAL: (parseInt(args.min_interval) || 300) * 1000,  // 全局最小刷新间隔 (ms)
   NETWORK_DEBOUNCE: 30000,       // 网络切换防抖间隔 30秒 (ms)
   SMART_COOLDOWN: 600000,        // 智能模式冷却 10分钟 (ms)
-  EMA_ALPHA: 0.3,                // EMA 平滑系数
-
-  // 探测域名列表（国内可直连域名，确保走 DIRECT 策略触发本地 DNS）
-  PROBE_DOMAINS: [
-    "www.baidu.com",
-    "www.taobao.com",
-    "www.qq.com",
-    "www.jd.com",
-    "www.163.com"
-  ],
 
   // 存储 Key
   STORE_KEYS: {
     LAST_FLUSH_TIME: "dns_flush_last_time",
-    FAIL_COUNT: "dns_flush_fail_count",
     NETWORK_STATE: "dns_flush_network_state",
     FLUSH_STATS: "dns_flush_stats",
-    EMA_LATENCY: "dns_flush_ema_latency",
     LAST_NETWORK_EVENT: "dns_flush_last_network_event",
     LAST_SMART_FLUSH: "dns_flush_last_smart_flush"
   }
@@ -70,25 +54,6 @@ function log(level, tag, message, data) {
   } catch (e) {
     // 日志不应影响正常流程
   }
-}
-
-// ==================== HTTP 工具 ====================
-
-// Promise 封装 $httpClient.get
-function httpGet(opts) {
-  return new Promise((resolve, reject) => {
-    const options = typeof opts === "string" ? { url: opts } : { ...opts };
-    const timeout = options.timeout || 10000;
-    delete options.timeout;
-
-    const timer = setTimeout(() => reject(new Error("Timeout")), timeout);
-
-    $httpClient.get(options, (error, response, data) => {
-      clearTimeout(timer);
-      if (error) reject(new Error(error));
-      else resolve({ status: response.status, headers: response.headers, body: data });
-    });
-  });
 }
 
 // ==================== 持久化存储工具 ====================
@@ -227,145 +192,8 @@ function loadNetworkState() {
   return readStore(CONFIG.STORE_KEYS.NETWORK_STATE, { type: "Unknown", detail: "未知" });
 }
 
-// ==================== DNS 探测模块 ====================
+// ==================== 延时工具 ====================
 
-// EMA（指数移动平均）更新
-function updateEMA(oldEMA, newValue, alpha) {
-  if (oldEMA === null || oldEMA === undefined) {
-    log(LOG_LEVEL.DEBUG, "EMA", `初始化 EMA = ${newValue} (无历史值)`);
-    return newValue;
-  }
-  const result = alpha * newValue + (1 - alpha) * oldEMA;
-  log(LOG_LEVEL.DEBUG, "EMA", `EMA 更新: ${Math.round(oldEMA)}ms → ${Math.round(result)}ms (新样本: ${Math.round(newValue)}ms, α=${alpha})`);
-  return result;
-}
-
-// 探测单个域名解析时间（走 DIRECT 策略，触发本地 DNS 解析）
-async function probeDomain(domain) {
-  const startTime = Date.now();
-  try {
-    await httpGet({
-      url: `http://${domain}/generate_204`,
-      timeout: CONFIG.PROBE_TIMEOUT,
-      policy: "DIRECT",
-      headers: { "User-Agent": "Surge-DNS-Flush/1.0" }
-    });
-    const latency = Date.now() - startTime;
-    log(LOG_LEVEL.DEBUG, "PROBE", `${domain} 探测成功: ${latency}ms`);
-    return { domain, latency, success: true };
-  } catch (e) {
-    // 即使 HTTP 错误，只要有响应就说明 DNS 解析成功
-    const elapsed = Date.now() - startTime;
-    if (elapsed < CONFIG.PROBE_TIMEOUT - 100) {
-      // 快速返回错误（如 404），说明 DNS 解析正常，只是路径不对
-      log(LOG_LEVEL.DEBUG, "PROBE", `${domain} HTTP错误但DNS正常: ${elapsed}ms (${e.message})`);
-      return { domain, latency: elapsed, success: true };
-    }
-    // 超时 = DNS 解析可能有问题
-    log(LOG_LEVEL.WARN, "PROBE", `${domain} 探测失败(超时): ${elapsed}ms`);
-    return { domain, latency: elapsed, success: false };
-  }
-}
-
-// 批量探测所有域名
-async function probeAllDomains() {
-  log(LOG_LEVEL.INFO, "PROBE", `开始批量探测 ${CONFIG.PROBE_DOMAINS.length} 个域名...`);
-  const results = await Promise.allSettled(
-    CONFIG.PROBE_DOMAINS.map(domain => probeDomain(domain))
-  );
-
-  const probeResults = results
-    .filter(r => r.status === "fulfilled")
-    .map(r => r.value);
-
-  const successResults = probeResults.filter(r => r.success);
-  const failResults = probeResults.filter(r => !r.success);
-
-  // 计算平均延迟（仅成功的）
-  const avgLatency = successResults.length > 0
-    ? successResults.reduce((sum, r) => sum + r.latency, 0) / successResults.length
-    : -1;
-
-  log(LOG_LEVEL.INFO, "PROBE", `探测完成: 成功=${successResults.length}, 失败=${failResults.length}, 平均延迟=${avgLatency > 0 ? Math.round(avgLatency) + "ms" : "N/A"}`);
-
-  return {
-    total: probeResults.length,
-    success: successResults.length,
-    fail: failResults.length,
-    avgLatency,
-    details: probeResults
-  };
-}
-
-// ==================== 智能刷新决策引擎 ====================
-
-// 判断是否需要刷新
-async function shouldFlush() {
-  // 检查最小刷新间隔
-  const lastFlushTime = readNumber(CONFIG.STORE_KEYS.LAST_FLUSH_TIME, 0);
-  const elapsed = Date.now() - lastFlushTime;
-  if (elapsed < CONFIG.MIN_FLUSH_INTERVAL) {
-    log(LOG_LEVEL.INFO, "SMART", `距上次刷新仅 ${Math.round(elapsed / 1000)}s，不足最小间隔 ${CONFIG.MIN_FLUSH_INTERVAL / 1000}s`);
-    return { needFlush: false, reason: "距上次刷新不足5分钟" };
-  }
-
-  // 执行探测
-  const probeResult = await probeAllDomains();
-
-  // 更新 EMA 延迟
-  if (probeResult.avgLatency > 0) {
-    const oldEMA = readNumber(CONFIG.STORE_KEYS.EMA_LATENCY, null);
-    const newEMA = updateEMA(oldEMA, probeResult.avgLatency, CONFIG.EMA_ALPHA);
-    writeNumber(CONFIG.STORE_KEYS.EMA_LATENCY, newEMA);
-  }
-
-  // 判断条件1：连续失败次数
-  let failCount = readNumber(CONFIG.STORE_KEYS.FAIL_COUNT, 0);
-  if (probeResult.fail > probeResult.success) {
-    failCount += 1;
-    writeNumber(CONFIG.STORE_KEYS.FAIL_COUNT, failCount);
-    log(LOG_LEVEL.WARN, "SMART", `探测多数失败，连续失败计数: ${failCount}/${CONFIG.FAIL_COUNT_THRESHOLD}`);
-    if (failCount >= CONFIG.FAIL_COUNT_THRESHOLD) {
-      log(LOG_LEVEL.INFO, "SMART", `触发刷新: 连续${failCount}次探测多数失败，达到阈值`);
-      return { needFlush: true, reason: `连续${failCount}次探测多数失败`, probeResult };
-    }
-  } else {
-    // 探测正常，重置失败计数
-    if (failCount > 0) {
-      log(LOG_LEVEL.DEBUG, "SMART", `探测恢复正常，重置失败计数 ${failCount} → 0`);
-    }
-    writeNumber(CONFIG.STORE_KEYS.FAIL_COUNT, 0);
-    failCount = 0;
-  }
-
-  // 判断条件2：平均解析时间超过阈值（使用 EMA 平滑后的值）
-  const emaLatency = readNumber(CONFIG.STORE_KEYS.EMA_LATENCY, 0);
-  if (emaLatency > CONFIG.LATENCY_THRESHOLD && probeResult.avgLatency > CONFIG.LATENCY_THRESHOLD) {
-    log(LOG_LEVEL.INFO, "SMART", `触发刷新: 延迟过高 (EMA: ${Math.round(emaLatency)}ms, 当前: ${Math.round(probeResult.avgLatency)}ms, 阈值: ${CONFIG.LATENCY_THRESHOLD}ms)`);
-    return { needFlush: true, reason: `解析延迟过高 (EMA: ${Math.round(emaLatency)}ms)`, probeResult };
-  }
-
-  // 判断条件3：完全探测失败
-  if (probeResult.success === 0 && probeResult.total > 0) {
-    log(LOG_LEVEL.INFO, "SMART", "触发刷新: 所有域名探测失败");
-    return { needFlush: true, reason: "所有域名探测失败", probeResult };
-  }
-
-  log(LOG_LEVEL.INFO, "SMART", `无需刷新: DNS状态正常 (EMA: ${Math.round(emaLatency)}ms, 当前: ${probeResult.avgLatency > 0 ? Math.round(probeResult.avgLatency) + "ms" : "N/A"})`);
-  return { needFlush: false, reason: "DNS状态正常", probeResult };
-}
-
-// 刷新后验证
-async function verifyAfterFlush() {
-  log(LOG_LEVEL.INFO, "FLUSH", "开始刷新后验证探测...");
-  // 等待短暂时间让 DNS 缓存清空后重建
-  await delay(1000);
-  const result = await probeAllDomains();
-  log(LOG_LEVEL.INFO, "FLUSH", `刷新后验证结果: 成功=${result.success}/${result.total}, 平均延迟=${result.avgLatency > 0 ? Math.round(result.avgLatency) + "ms" : "N/A"}`);
-  return result;
-}
-
-// 延时工具
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -411,20 +239,8 @@ async function handleManualFlush() {
   log(LOG_LEVEL.INFO, "FLUSH", "执行手动刷新模式...");
   await flushDNS();
   writeNumber(CONFIG.STORE_KEYS.LAST_FLUSH_TIME, Date.now());
-  writeNumber(CONFIG.STORE_KEYS.FAIL_COUNT, 0);
   const stats = updateStats("manual");
-
-  // 刷新后探测验证
-  const verify = await probeAllDomains();
-  const avgMs = verify.avgLatency > 0 ? Math.round(verify.avgLatency) : "--";
-  log(LOG_LEVEL.INFO, "FLUSH", `手动刷新完成，验证延迟: ${avgMs}ms`);
-
-  return {
-    success: true,
-    message: `手动刷新完成`,
-    avgLatency: avgMs,
-    stats
-  };
+  return { success: true, message: "手动刷新完成", stats };
 }
 
 // 网络切换刷新模式（含防抖机制）
@@ -478,7 +294,6 @@ async function handleNetworkFlush() {
   log(LOG_LEVEL.INFO, "NET", `网络切换触发刷新: ${previousNetwork.detail} → ${currentNetwork.detail}`);
   await flushDNS();
   writeNumber(CONFIG.STORE_KEYS.LAST_FLUSH_TIME, Date.now());
-  writeNumber(CONFIG.STORE_KEYS.FAIL_COUNT, 0);
   const stats = updateStats("network");
 
   $notification.post(
@@ -496,68 +311,24 @@ async function handleNetworkFlush() {
 
 // 智能刷新模式（含10分钟冷却期）
 async function handleSmartFlush() {
-  log(LOG_LEVEL.INFO, "SMART", "执行智能刷新模式...");
+  log(LOG_LEVEL.INFO, "SMART", "执行定时刷新模式...");
   // 检查智能模式专属冷却（10分钟）
   const lastSmartFlush = readNumber(CONFIG.STORE_KEYS.LAST_SMART_FLUSH, 0);
   const smartElapsed = Date.now() - lastSmartFlush;
   if (smartElapsed < CONFIG.SMART_COOLDOWN) {
     const remaining = Math.ceil((CONFIG.SMART_COOLDOWN - smartElapsed) / 1000);
-    const emaLatency = readNumber(CONFIG.STORE_KEYS.EMA_LATENCY, 0);
-    log(LOG_LEVEL.INFO, "COOL", `智能模式冷却中: 剩余 ${formatCooldownTime(remaining)}, EMA=${emaLatency > 0 ? Math.round(emaLatency) + "ms" : "N/A"}`);
-    return {
-      success: true,
-      message: `智能冷却中 (${remaining}s)`,
-      skipped: true,
-      cooldownRemaining: remaining,
-      avgLatency: emaLatency > 0 ? Math.round(emaLatency) : "--"
-    };
+    log(LOG_LEVEL.INFO, "COOL", `智能模式冷却中: ${formatCooldownTime(remaining)}`);
+    return { success: true, message: `冷却中 (${formatCooldownTime(remaining)})`, skipped: true, cooldownRemaining: remaining };
   }
 
-  const decision = await shouldFlush();
-  log(LOG_LEVEL.INFO, "SMART", `智能决策结果: needFlush=${decision.needFlush}, reason="${decision.reason}"`);
-
-  if (!decision.needFlush) {
-    // 无需刷新，返回当前状态
-    const emaLatency = readNumber(CONFIG.STORE_KEYS.EMA_LATENCY, 0);
-    return {
-      success: true,
-      message: decision.reason,
-      skipped: true,
-      avgLatency: emaLatency > 0 ? Math.round(emaLatency) : "--"
-    };
-  }
-
-  // 需要刷新
+  // 直接刷新
   await flushDNS();
   const now = Date.now();
   writeNumber(CONFIG.STORE_KEYS.LAST_FLUSH_TIME, now);
   writeNumber(CONFIG.STORE_KEYS.LAST_SMART_FLUSH, now);
-  writeNumber(CONFIG.STORE_KEYS.FAIL_COUNT, 0);
   const stats = updateStats("smart");
 
-  // 验证刷新效果
-  const verify = await verifyAfterFlush();
-  const avgMs = verify.avgLatency > 0 ? Math.round(verify.avgLatency) : "--";
-
-  // 更新 EMA
-  if (verify.avgLatency > 0) {
-    writeNumber(CONFIG.STORE_KEYS.EMA_LATENCY, verify.avgLatency);
-  }
-
-  log(LOG_LEVEL.INFO, "SMART", `智能刷新完成: 原因="${decision.reason}", 验证延迟=${avgMs}ms`);
-
-  $notification.post(
-    "DNS缓存智能刷新",
-    `原因: ${decision.reason}`,
-    `验证延迟: ${avgMs}ms | 成功率: ${verify.success}/${verify.total}`
-  );
-
-  return {
-    success: true,
-    message: `智能刷新: ${decision.reason}`,
-    avgLatency: avgMs,
-    stats
-  };
+  return { success: true, message: "定时刷新完成", stats };
 }
 
 // ==================== Panel 格式化 ====================
@@ -576,7 +347,7 @@ function formatModeName(mode) {
   const modeNames = {
     manual: "手动",
     network: "网络切换",
-    smart: "智能"
+    smart: "定时"
   };
   return modeNames[mode] || "未知";
 }
@@ -584,35 +355,23 @@ function formatModeName(mode) {
 // 生成 Panel 输出内容
 function formatPanelOutput(mode, result) {
   const stats = result.stats || loadStats();
-  const network = loadNetworkState();
-  const emaLatency = readNumber(CONFIG.STORE_KEYS.EMA_LATENCY, 0);
-  const avgMs = result.avgLatency || (emaLatency > 0 ? Math.round(emaLatency) : "--");
-
-  // DNS 状态判定
-  let dnsStatus;
-  if (avgMs === "--") {
-    dnsStatus = "⚠️ 未知";
-  } else if (avgMs < 100) {
-    dnsStatus = `✅ 正常 (avg ${avgMs}ms)`;
-  } else if (avgMs < CONFIG.LATENCY_THRESHOLD) {
-    dnsStatus = `⚡ 一般 (avg ${avgMs}ms)`;
-  } else {
-    dnsStatus = `❌ 异常 (avg ${avgMs}ms)`;
-  }
+  const network = detectNetworkType();
+  const networkDisplay = network.type === "WiFi" ? `WiFi(${network.detail})` : network.type;
 
   const modeName = formatModeName(mode);
   const lastTime = formatTime(stats.lastFlushTime);
-  const networkDisplay = network.type === "WiFi" ? `WiFi(${network.detail})` : network.type;
 
   // 组装输出
-  let content = `模式: ${modeName} | 已刷新: ${stats.totalFlushes}次\n`;
-  content += `上次: ${lastTime} | 网络: ${networkDisplay}\n`;
+  let content = `网络: ${networkDisplay} | 已刷新: ${stats.totalFlushes}次\n`;
+  content += `上次: ${lastTime} | 模式: ${modeName}\n`;
 
   // 冷却状态显示
   if (result.cooldownRemaining) {
     content += `⏳ 冷却中: ${formatCooldownTime(result.cooldownRemaining)}`;
+  } else if (result.skipped) {
+    content += `⏸️ ${result.message}`;
   } else {
-    content += `DNS状态: ${dnsStatus}`;
+    content += `✅ ${result.message}`;
   }
 
   return content;
