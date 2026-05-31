@@ -345,13 +345,6 @@ const SPEED_TEST_FILES = {
   DEFAULT: { url: "http://cachefly.cachefly.net/2mb.test", size: 2097152 }
 };
 
-// 流媒体专用测速文件（uhdnow.com 视频资源）
-const STREAMING_TEST_FILE = {
-  url: "https://www.uhdnow.com/landing/hero-prism.mp4",
-  // 文件大小未知，用下载时间+实际接收字节计算速率
-  // 超时设为 15 秒（视频文件可能较大）
-  timeout: 15000
-};
 
 // 测试指定地区的下载速率（通过 Smart 组路由）
 // 返回 { speedBps: number (bytes/s), elapsed: number (s) } 或 null（超时/失败）
@@ -376,32 +369,6 @@ async function testRegionSpeed(region, smartGroupName) {
   }
 }
 
-// 测试指定地区到流媒体站点的下载速率
-// 返回 { speedBps: number, elapsed: number } 或 null
-async function testStreamingSpeed(region, smartGroupName) {
-  try {
-    const startTime = Date.now();
-    const resp = await httpGet({
-      url: STREAMING_TEST_FILE.url,
-      policy: smartGroupName,
-      timeout: STREAMING_TEST_FILE.timeout || 15000,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Range": "bytes=0-2097151"  // 只下载前 2MB，避免文件太大
-      }
-    });
-    const elapsed = (Date.now() - startTime) / 1000;
-    // 用响应体长度计算速率（Range 请求返回实际字节数）
-    const bytes = resp.body ? resp.body.length : 0;
-    if (bytes === 0) return null;
-    const speedBps = bytes / elapsed;
-    log("info", "Stream", `${region} 流媒体测速`, { speedMbps: (speedBps * 8 / 1048576).toFixed(2), bytes, elapsed: elapsed.toFixed(2) });
-    return { speedBps, elapsed };
-  } catch (e) {
-    log("warn", "Stream", `${region} 流媒体测速失败`, { error: e.message });
-    return null;
-  }
-}
 
 // ==================== 综合测试（已重构为地区级）====================
 
@@ -865,13 +832,10 @@ const FALLBACK_REORDER_CONFIG = {
 // maxSpeedMbps: 本轮所有地区中的最大速度，用于相对归一化
 function calcRegionScore(regionData, sortBy, minSpeedMbps, maxSpeedMbps) {
   const unlock = regionData.unlock || 0;          // 0-1
-  // 对于 unlock 排序模式（流媒体/Netflix容灾），优先用流媒体测速结果
-  const speed = (sortBy === "unlock" && regionData.streamingSpeedMbps > 0)
-    ? regionData.streamingSpeedMbps
-    : (regionData.speedMbps || 0);
+  const speed = regionData.speedMbps || 0;
   const latency = regionData.latencyMs || 999;     // ms
   
-  // min-max 归一化（clamp 防止流媒体速度超出范围）
+  // min-max 归一化
   const speedRange = maxSpeedMbps - minSpeedMbps;
   const speedNorm = speedRange > 0 ? Math.min(Math.max((speed - minSpeedMbps) / speedRange, 0), 1) : 0.5;
   const latencyNorm = 1 - Math.min(latency / 500, 1);    // 500ms 零分
@@ -1338,41 +1302,6 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
       }
     }
     
-    // 阶段3：流媒体专项测速（串行，用于流媒体容灾排序）
-    log("info", "Main", "开始流媒体专项测速");
-    const streamingResults = {};
-    for (const [region, data] of activeRegionEntries) {
-      const streamResult = await testStreamingSpeed(region, data.smartGroup);
-      streamingResults[region] = streamResult;
-    }
-    log("info", "Stream", "流媒体测速完成", {
-      results: Object.entries(streamingResults).map(([r, s]) =>
-        `${r}:${s ? (s.speedBps * 8 / 1048576).toFixed(1) + "Mbps" : "失败"}`
-      ).join(", ")
-    });
-    
-    // 融合流媒体测速到节点速度评估（流媒体占40%，通用测速占60%）
-    for (const [region, data] of activeRegionEntries) {
-      if (streamingResults[region] && regionResults[region]) {
-        const streamSpeed = streamingResults[region].speedBps;
-        const regionResult = regionResults[region];
-        const hasGenericSpeed = regionResult.length > 0 && regionResult[0].speedBps > 0;
-        const blendedSpeed = hasGenericSpeed
-          ? regionResult[0].speedBps * 0.6 + streamSpeed * 0.4
-          : streamSpeed;
-        for (const result of regionResult) {
-          result.speedBps = blendedSpeed;
-        }
-        // 用混合速度重新更新节点历史的 emaSpeed
-        for (const result of regionResult) {
-          if (history.nodes[result.proxyName]) {
-            history.nodes[result.proxyName].emaSpeed = updateEMA(
-              history.nodes[result.proxyName].emaSpeed, blendedSpeed, 0.3
-            );
-          }
-        }
-      }
-    }
     
     // 5. 重新计算所有节点的综合评分
     recalculateAllScores(history);
@@ -1397,10 +1326,7 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
       regionScores[region] = {
         unlock: unlockResult ? unlockResult.unlockScore : 0,
         speedMbps: speedMbps,
-        latencyMs: avgLatency,
-        streamingSpeedMbps: streamingResults[region]
-          ? (streamingResults[region].speedBps * 8) / 1048576
-          : 0
+        latencyMs: avgLatency
       };
     }
     // 计算本轮 min/max
