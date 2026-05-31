@@ -1383,12 +1383,8 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
       log("info", "Main", "Profile 同步完成");
     }
     
-    // 9. 触发 Surge 重载
-    if (CONFIG.DRY_RUN) {
-      log("info", "DryRun", "跳过 Profile 重载");
-    } else {
-      await reloadProfile();
-    }
+    // 9. 不自动重载 Profile（用户手动控制重载时机，避免中断活跃连接）
+    log("info", "Main", "跳过 Profile 重载（由用户手动触发）");
     
     // DRY_RUN 模式下额外打印调试信息
     if (CONFIG.DRY_RUN) {
