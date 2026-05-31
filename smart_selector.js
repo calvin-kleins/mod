@@ -241,6 +241,36 @@ async function reloadProfile() {
   await surgeAPI("POST", "/v1/profiles/reload");
 }
 
+// ==================== 网络类型检测 ====================
+
+// 检测当前设备网络连接类型
+// 返回: "WiFi" | "有线" | "移动"
+function detectNetworkType() {
+  if (typeof $network !== 'undefined' && $network) {
+    // 如果有 WiFi SSID → WiFi
+    if ($network.wifi && $network.wifi.ssid) {
+      return "WiFi";
+    }
+    // 通过 primaryInterface 区分有线/蜂窝
+    if ($network.v4 && $network.v4.primaryInterface) {
+      const iface = $network.v4.primaryInterface;
+      // pdp_ip0 = Cellular on iOS, utun = VPN tunnel
+      if (iface.startsWith("pdp_ip") || iface.startsWith("utun")) {
+        return "移动";
+      }
+      // en0 = WiFi (already handled above if ssid exists)
+      // en1/en2... = Ethernet on Mac
+      if (iface.startsWith("en") && iface !== "en0") {
+        return "有线";
+      }
+    }
+    // 默认：如果在 Mac 且无 WiFi，假定有线
+    return "有线";
+  }
+  // $network 不可用时 fallback 到 WiFi
+  return "WiFi";
+}
+
 // ==================== 地区分类（通过 /v1/policy_groups 获取 Smart 组成员）====================
 
 // ==================== 解锁检测模块 ====================
@@ -556,30 +586,68 @@ function selectTestTargets(history, nodes, region, count) {
   return selected;
 }
 
-// 基于 ML 模型生成所有节点权重
-function generateWeightsFromModel(history, regional) {
+// 基于 ML 模型生成所有节点权重（含 EMA 平滑 + 权重上下限）
+function generateWeightsFromModel(history, regional, currentNetworkType) {
   const weightMap = {};
+  const EMA_ALPHA = 0.6;           // 当前测量权重60%，历史40%
+  const MAX_WEIGHT_RATIO = 3.0;    // 最高权重不超过平均值的 3 倍
+  const MIN_WEIGHT = 0.1;          // 最低权重不低于 0.1
+  
+  // 读取历史权重（按网络类型分开存储）
+  const allNetworkWeights = history.regionWeights || {};
+  const historyWeights = allNetworkWeights[currentNetworkType] || {};
+  // 本轮新权重（用于保存）
+  const newRegionWeights = {};
   
   for (const [region, nodes] of Object.entries(regional)) {
     if (nodes.length === 0) continue;
     
-    const entries = nodes
+    // 计算原始权重
+    const rawEntries = nodes
       .map(name => {
         const node = history.nodes[name];
         if (!node) return null;
         // score 高 -> weight 低 -> 优先级高
         // score 范围 [0, 1] -> weight 映射到 [0.3, 3.0]
         const weight = clamp(mapRange(node.score, 0, 1, 3.0, 0.3), 0.3, 3.0);
-        return `${name}:${weight.toFixed(2)}`;
+        return { name, weight };
       })
       .filter(Boolean);
     
-    if (entries.length > 0) {
-      weightMap[region] = entries.join(";");
+    if (rawEntries.length === 0) continue;
+    
+    // 1.1 EMA 平滑：对每个节点的最终权重做 EMA
+    let weights = rawEntries.map(entry => {
+      const histW = historyWeights[entry.name];
+      const smoothed = (histW !== undefined && histW !== null)
+        ? EMA_ALPHA * entry.weight + (1 - EMA_ALPHA) * histW
+        : entry.weight;
+      return { name: entry.name, weight: smoothed };
+    });
+    
+    // 1.2 权重上限/下限
+    const avgWeight = weights.reduce((sum, w) => sum + w.weight, 0) / weights.length;
+    weights = weights.map(w => ({
+      name: w.name,
+      weight: Math.max(Math.min(w.weight, avgWeight * MAX_WEIGHT_RATIO), MIN_WEIGHT)
+    }));
+    
+    // 保存本轮权重供下次 EMA 使用
+    for (const w of weights) {
+      newRegionWeights[w.name] = w.weight;
     }
+    
+    const entries = weights.map(w => `${w.name}:${w.weight.toFixed(2)}`);
+    weightMap[region] = entries.join(";");
+    
+    log("debug", "ML", `${region} EMA平滑`, { avg: avgWeight.toFixed(2), nodes: weights.length });
   }
   
-  log("info", "Profile", "权重已更新", { regions: Object.keys(weightMap) });
+  // 1.3 保存权重历史（按网络类型分开存储）
+  if (!history.regionWeights) history.regionWeights = {};
+  history.regionWeights[currentNetworkType] = newRegionWeights;
+  
+  log("info", "Profile", "权重已更新(EMA+cap)", { regions: Object.keys(weightMap) });
   return weightMap;
 }
 
@@ -631,8 +699,9 @@ function matchSmartGroupRegion(groupLine) {
 // 更新 Profile 中 Smart 组的 policy-priority 参数
 // profileText: 完整的 Surge 配置文本
 // weightMap: { "HK": "NodeA:0.6;NodeB:1.2", "JP": "..." }
+// suffix: 当前网络类型后缀，如 "-WiFi"，只更新匹配该后缀的 Smart 组
 // 返回修改后的完整配置文本
-function updateProfileWeights(profileText, weightMap) {
+function updateProfileWeights(profileText, weightMap, suffix) {
   const lines = profileText.split("\n");
   let inProxyGroup = false;
   let currentSection = "";
@@ -653,6 +722,13 @@ function updateProfileWeights(profileText, weightMap) {
     // 检查是否是 smart 类型的组
     // Surge 配置格式: "GroupName = smart, ..."（smart 紧跟在 = 后面，非 type=smart 参数）
     if (!/=\s*smart\b/i.test(line)) continue;
+    
+    // 只处理匹配当前网络类型后缀的 Smart 组
+    const groupNameMatch2 = line.match(/^\s*([^=]+?)\s*=/);
+    if (groupNameMatch2) {
+      const gName = groupNameMatch2[1].trim();
+      if (suffix && !gName.endsWith(suffix)) continue;
+    }
     
     // 匹配该 Smart 组的地区
     const region = matchSmartGroupRegion(line);
@@ -675,6 +751,152 @@ function updateProfileWeights(profileText, weightMap) {
         lines[i] = lines[i].replace(/\s*$/, `, ${priorityValue}`);
       }
     }
+  }
+  
+  return lines.join("\n");
+}
+
+// ==================== Fallback 地区排序模块 ====================
+
+// Fallback 组重排配置
+const FALLBACK_REORDER_CONFIG = {
+  "代理容灾": { exclude: [], sortBy: "overall" },
+  "Google容灾": { exclude: [], sortBy: "latency" },
+  "Netflix容灾": { exclude: [], sortBy: "unlock" },
+  "流媒体容灾": { exclude: [], sortBy: "unlock" },
+  "AIGC容灾": { exclude: ["HK"], sortBy: "overall" },
+  "游戏容灾": { exclude: ["US", "TW"], sortBy: "latency", suffix: ["DIRECT"] },
+  "TG容灾": { exclude: [], sortBy: "latency" },
+  "Apple容灾": { regions: ["HK", "US", "JP"], sortBy: "latency" },
+};
+
+// 计算地区综合分
+// regionScores 格式: { HK: { unlock, speedMbps, latencyMs }, ... }
+function calcRegionScore(regionData, sortBy) {
+  const unlock = regionData.unlock || 0;          // 0-1
+  const speed = regionData.speedMbps || 0;         // Mbps
+  const latency = regionData.latencyMs || 999;     // ms
+  
+  // 归一化
+  const speedNorm = Math.min(speed / 20, 1);              // 20Mbps 满分
+  const latencyNorm = 1 - Math.min(latency / 500, 1);    // 500ms 零分
+  
+  if (sortBy === "latency") {
+    // 延迟优先：延迟占 60%，速度 25%，解锁 15%
+    return latencyNorm * 0.6 + speedNorm * 0.25 + unlock * 0.15;
+  } else if (sortBy === "unlock") {
+    // 解锁优先：解锁占 50%，速度 30%，延迟 20%
+    return unlock * 0.5 + speedNorm * 0.3 + latencyNorm * 0.2;
+  } else {
+    // overall 综合分
+    return unlock * 0.3 + speedNorm * 0.4 + latencyNorm * 0.3;
+  }
+}
+
+// 对 Profile 中的 Fallback 组做地区重排
+function reorderFallbackGroups(profileText, regionScores) {
+  const lines = profileText.split("\n");
+  let inProxyGroup = false;
+  let currentSection = "";
+  
+  // 所有可能的地区简称
+  const ALL_REGIONS = Object.keys(CONFIG.REGION_GROUPS);
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    
+    // 检测 section 切换
+    if (line.startsWith("[")) {
+      currentSection = line;
+      inProxyGroup = (line === "[Proxy Group]");
+      continue;
+    }
+    
+    if (!inProxyGroup) continue;
+    if (!line || line.startsWith("#") || line.startsWith("//")) continue;
+    
+    // 检查是否是 fallback 类型的组
+    if (!/=\s*fallback\b/i.test(line)) continue;
+    
+    // 提取组名
+    const groupNameMatch = lines[i].match(/^\s*([^=]+?)\s*=/);
+    if (!groupNameMatch) continue;
+    const groupName = groupNameMatch[1].trim();
+    
+    // 检查该组是否在重排配置中
+    const config = FALLBACK_REORDER_CONFIG[groupName];
+    if (!config) continue;
+    
+    // 解析 Fallback 行
+    // 格式: 组名 = fallback, 地区1, 地区2, ..., 自动选优/DIRECT, url=..., interval=...
+    const eqIndex = lines[i].indexOf("=");
+    const afterEq = lines[i].substring(eqIndex + 1).trim();
+    
+    // 分离参数部分（url=, interval=, timeout=, evaluate-before-use=, hidden=, icon-url= 等）
+    const parts = afterEq.split(",").map(p => p.trim());
+    const policyType = parts[0]; // "fallback"
+    
+    // 分离成员和参数
+    const members = [];
+    const params = [];
+    const paramPattern = /^(url|interval|timeout|evaluate-before-use|hidden|icon-url|no-alert|policy-regex-filter)\s*=/;
+    
+    for (let j = 1; j < parts.length; j++) {
+      if (paramPattern.test(parts[j])) {
+        params.push(parts[j]);
+      } else {
+        members.push(parts[j]);
+      }
+    }
+    
+    // 分离特殊成员（自动选优、DIRECT 等）和地区成员
+    const specialMembers = []; // 非地区成员（如 "自动选优", "DIRECT"）
+    const regionMembers = [];  // 地区成员
+    
+    for (const m of members) {
+      if (ALL_REGIONS.includes(m)) {
+        regionMembers.push(m);
+      } else {
+        specialMembers.push(m);
+      }
+    }
+    
+    // 确定参与排序的地区
+    let sortableRegions;
+    if (config.regions) {
+      // 指定了参与的地区列表
+      sortableRegions = config.regions.filter(r => regionMembers.includes(r));
+    } else {
+      // 从当前成员中排除 exclude
+      sortableRegions = regionMembers.filter(r => !config.exclude.includes(r));
+    }
+    
+    // 按分数排序（降序：分高优先）
+    sortableRegions.sort((a, b) => {
+      const scoreA = regionScores[a] ? calcRegionScore(regionScores[a], config.sortBy) : 0;
+      const scoreB = regionScores[b] ? calcRegionScore(regionScores[b], config.sortBy) : 0;
+      return scoreB - scoreA;
+    });
+    
+    // 重组成员列表
+    // 被 exclude 的地区不参与，也不保留在结果中
+    let newMembers = [...sortableRegions];
+    
+    // 添加特殊后缀
+    if (config.suffix) {
+      // 使用配置的 suffix
+      newMembers = newMembers.concat(config.suffix);
+    } else {
+      // 保留原来的特殊成员在末尾
+      newMembers = newMembers.concat(specialMembers);
+    }
+    
+    // 重组行
+    const prefix = lines[i].substring(0, eqIndex + 1);
+    const newLine = `${prefix} ${policyType}, ${newMembers.join(", ")}${params.length > 0 ? ", " + params.join(", ") : ""}`;
+    lines[i] = newLine;
+    
+    log("info", "Fallback", "地区排序", { group: groupName, order: sortableRegions });
   }
   
   return lines.join("\n");
@@ -808,7 +1030,10 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
     if (!CONFIG.GITHUB_TOKEN) throw new Error("未配置 GitHub Token");
     if (!CONFIG.GIST_ID) throw new Error("未配置 Gist ID");
     
-    log("info", "Main", "Smart Selector 启动", { dryRun: CONFIG.DRY_RUN });
+    // 检测当前网络类型，确定 Smart 组后缀
+    const networkType = detectNetworkType(); // "WiFi" | "有线" | "移动"
+    const networkSuffix = "-" + networkType;  // "-WiFi" | "-有线" | "-移动"
+    log("info", "Main", "Smart Selector 启动", { dryRun: CONFIG.DRY_RUN, network: networkType, suffix: networkSuffix });
     log("debug", "Main", "配置验证通过");
     
     // ==================== API 端点探测（仅 DRY_RUN 模式，带缓存）====================
@@ -864,21 +1089,15 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
     const isColdStart = !history || history.runCount === 0;
     
     // 2. 从各地区 Smart 组获取代理节点（含 hashMap）
+    // 只获取当前网络类型对应的 Smart 组
     // regionData 格式: { HK: { nodes: [...], hashMap: {...}, smartGroup: "HK-WiFi" }, ... }
     const regionData = {};
-    const networkSuffixes = ["-WiFi", "-有线", "-移动"];
 
     for (const [region, groupPrefix] of Object.entries(CONFIG.REGION_GROUPS)) {
-      for (const suffix of networkSuffixes) {
-        const groupName = groupPrefix + suffix;
-        const { nodes, hashMap } = await getGroupMembers(groupName);
-        if (nodes.length > 0) {
-          regionData[region] = { nodes, hashMap, smartGroup: groupName };
-          break;
-        }
-      }
-      if (!regionData[region]) regionData[region] = { nodes: [], hashMap: {}, smartGroup: "" };
-      log("info", "Main", `${region} 获取到 ${regionData[region].nodes.length} 个节点`, { smartGroup: regionData[region].smartGroup });
+      const smartGroupName = groupPrefix + networkSuffix; // e.g. "HK-WiFi" or "HK-有线"
+      const { nodes, hashMap } = await getGroupMembers(smartGroupName);
+      regionData[region] = { nodes, hashMap, smartGroup: smartGroupName };
+      log("info", "Main", `${region} 获取到 ${regionData[region].nodes.length} 个节点`, { smartGroup: smartGroupName });
     }
 
     // 兼容后续需要 regional 格式的地方
@@ -973,13 +1192,38 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
     recalculateAllScores(history);
     
     // 6. 基于 ML 模型生成权重（对所有已知节点）
-    const weightMap = generateWeightsFromModel(history, regional);
+    const weightMap = generateWeightsFromModel(history, regional, networkType);
     if (Object.keys(weightMap).length === 0) throw new Error("无有效测试结果");
     
-    // 7. 下载 Profile -> 更新权重 -> 上传 Gist
+    // 7. 构建地区综合分数据（供 Fallback 重排使用）
+    const regionScores = {};
+    for (const [region, data] of Object.entries(regionData)) {
+      if (data.nodes.length === 0) continue;
+      const unlockResult = unlockMap[region];
+      // 计算地区平均延迟
+      const latencies = Object.values(regionLatencies[region] || {});
+      const avgLatency = latencies.length > 0 ? latencies.reduce((a, b) => a + b, 0) / latencies.length : 999;
+      // 计算地区测速（从 regionResults 中获取）
+      const regionResult = regionResults[region];
+      const speedBps = (regionResult && regionResult.length > 0) ? regionResult[0].speedBps : 0;
+      const speedMbps = (speedBps * 8) / 1048576; // 转换为 Mbps
+      
+      regionScores[region] = {
+        unlock: unlockResult ? unlockResult.unlockScore : 0,
+        speedMbps: speedMbps,
+        latencyMs: avgLatency
+      };
+    }
+    log("info", "Main", "地区综合分", { scores: Object.fromEntries(Object.entries(regionScores).map(([r, s]) => [r, calcRegionScore(s, "overall").toFixed(3)])) });
+    
+    // 8. 下载 Profile -> 更新 Smart 组权重 -> Fallback 重排 -> 上传 Gist
     log("info", "Main", "Profile 同步流程开始");
     const profile = await downloadProfile();
-    const updatedProfile = updateProfileWeights(profile, weightMap);
+    // 8a. 更新 Smart 组的 policy-priority（只更新当前网络类型的 Smart 组）
+    const profileWithWeights = updateProfileWeights(profile, weightMap, networkSuffix);
+    // 8b. 对 Fallback 组做地区重排
+    const updatedProfile = reorderFallbackGroups(profileWithWeights, regionScores);
+    
     if (CONFIG.DRY_RUN) {
       log("info", "DryRun", "跳过 Gist 上传", { regions: Object.keys(weightMap) });
     } else {
@@ -987,7 +1231,7 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
       log("info", "Main", "Profile 同步完成");
     }
     
-    // 8. 触发 Surge 重载
+    // 9. 触发 Surge 重载
     if (CONFIG.DRY_RUN) {
       log("info", "DryRun", "跳过 Profile 重载");
     } else {
@@ -1013,12 +1257,12 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
       }
     }
     
-    // 9. 保存历史数据
+    // 10. 保存历史数据
     history.lastRun = new Date().toISOString();
     history.runCount = (history.runCount || 0) + 1;
     saveHistory(history);
     
-    // 10. Panel 输出
+    // 11. Panel 输出
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
     // 统计处于冷却期的节点数
     const now = Date.now();
