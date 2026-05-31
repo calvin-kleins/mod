@@ -4,7 +4,7 @@
 #!category=Panel
 
 [Panel]
-流媒体检测 = script-name=流媒体检测,update-interval=3600,icon=play.tv.fill,icon-color=#06D6A0
+流媒体检测 = script-name=流媒体检测,update-interval=7200,icon=play.tv.fill,icon-color=#06D6A0
 
 [Script]
 流媒体检测 = type=generic,timeout=40,script-path=https://raw.githubusercontent.com/calvin-kleins/mod/refs/heads/main/media_check.js
