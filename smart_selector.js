@@ -610,7 +610,15 @@ function generateWeightsFromModel(history, regional, currentNetworkType) {
         // score 高 -> weight 低 -> 优先级高
         // score 范围 [0, 1] -> weight 映射到 [0.3, 3.0]
         const weight = clamp(mapRange(node.score, 0, 1, 3.0, 0.3), 0.3, 3.0);
-        return { name, weight };
+        
+        // 流量倍率惩罚：高倍率节点 weight 更大（weight 大 = 优先级低）
+        const multiplier = parseMultiplier(name);
+        const adjustedWeight = weight * multiplier;
+        if (multiplier > 1) {
+          log("debug", "ML", "流量倍率惩罚", { node: name, multiplier, originalWeight: weight.toFixed(2), adjustedWeight: adjustedWeight.toFixed(2) });
+        }
+        
+        return { name, weight: adjustedWeight };
       })
       .filter(Boolean);
     
@@ -664,6 +672,13 @@ function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
 }
 
+// 从节点名解析流量倍率
+// 匹配模式: "2x", "2X", "2×", "2倍", "1.5x", "-3x" 等
+function parseMultiplier(nodeName) {
+  const match = nodeName.match(/(\d+(?:\.\d+)?)\s*[xX×倍]/);
+  return match ? parseFloat(match[1]) : 1;
+}
+
 // 计算单个节点权重
 // unlockScore: 0-1, speedBps: bytes/s, latencyMs: ms, maxSpeedInGroup: bytes/s
 function calculateWeight(unlockScore, speedBps, latencyMs, maxSpeedInGroup) {
@@ -696,12 +711,25 @@ function matchSmartGroupRegion(groupLine) {
   return null;
 }
 
+// 注释插入/更新工具
+function insertOrUpdateComment(lines, targetIndex, comment) {
+  if (targetIndex > 0 && lines[targetIndex - 1].trim().startsWith("# [SmartSelector]")) {
+    lines[targetIndex - 1] = comment;
+    return 0;
+  } else {
+    lines.splice(targetIndex, 0, comment);
+    return 1;
+  }
+}
+
 // 更新 Profile 中 Smart 组的 policy-priority 参数
 // profileText: 完整的 Surge 配置文本
 // weightMap: { "HK": "NodeA:0.6;NodeB:1.2", "JP": "..." }
 // suffix: 当前网络类型后缀，如 "-WiFi"，只更新匹配该后缀的 Smart 组
+// regionScores: 地区综合分数据
+// networkType: 当前网络类型
 // 返回修改后的完整配置文本
-function updateProfileWeights(profileText, weightMap, suffix) {
+function updateProfileWeights(profileText, weightMap, suffix, regionScores, networkType) {
   const lines = profileText.split("\n");
   let inProxyGroup = false;
   let currentSection = "";
@@ -751,6 +779,14 @@ function updateProfileWeights(profileText, weightMap, suffix) {
         lines[i] = lines[i].replace(/\s*$/, `, ${priorityValue}`);
       }
     }
+    
+    // 在修改行上方插入/更新 SmartSelector 注释
+    if (regionScores && regionScores[region]) {
+      const score = regionScores[region];
+      const now = new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+      const comment = `# [SmartSelector] ${now} ${networkType} | 解锁:${score.unlock.toFixed(2)} 速度:${score.speedMbps.toFixed(1)}Mbps 延迟:${Math.round(score.latencyMs)}ms`;
+      i += insertOrUpdateComment(lines, i, comment);
+    }
   }
   
   return lines.join("\n");
@@ -762,9 +798,9 @@ function updateProfileWeights(profileText, weightMap, suffix) {
 const FALLBACK_REORDER_CONFIG = {
   "代理容灾": { exclude: [], sortBy: "overall" },
   "Google容灾": { exclude: [], sortBy: "latency" },
-  "Netflix容灾": { exclude: [], sortBy: "unlock" },
-  "流媒体容灾": { exclude: [], sortBy: "unlock" },
-  "AIGC容灾": { exclude: ["HK"], sortBy: "overall" },
+  "Netflix容灾": { exclude: [], sortBy: "unlock", requiredUnlock: ["Netflix"] },
+  "流媒体容灾": { exclude: [], sortBy: "unlock", requiredUnlock: ["Netflix", "Disney+"] },
+  "AIGC容灾": { exclude: ["HK"], sortBy: "overall", requiredUnlock: ["Gemini", "ChatGPT"] },
   "游戏容灾": { exclude: ["US", "TW"], sortBy: "latency", suffix: ["DIRECT"] },
   "TG容灾": { exclude: [], sortBy: "latency" },
   "Apple容灾": { regions: ["HK", "US", "JP"], sortBy: "latency" },
@@ -772,13 +808,15 @@ const FALLBACK_REORDER_CONFIG = {
 
 // 计算地区综合分
 // regionScores 格式: { HK: { unlock, speedMbps, latencyMs }, ... }
-function calcRegionScore(regionData, sortBy) {
+// maxSpeedMbps: 本轮所有地区中的最大速度，用于相对归一化
+function calcRegionScore(regionData, sortBy, minSpeedMbps, maxSpeedMbps) {
   const unlock = regionData.unlock || 0;          // 0-1
   const speed = regionData.speedMbps || 0;         // Mbps
   const latency = regionData.latencyMs || 999;     // ms
   
-  // 归一化
-  const speedNorm = Math.min(speed / 20, 1);              // 20Mbps 满分
+  // min-max 归一化
+  const speedRange = maxSpeedMbps - minSpeedMbps;
+  const speedNorm = speedRange > 0 ? (speed - minSpeedMbps) / speedRange : 0.5;
   const latencyNorm = 1 - Math.min(latency / 500, 1);    // 500ms 零分
   
   if (sortBy === "latency") {
@@ -794,7 +832,9 @@ function calcRegionScore(regionData, sortBy) {
 }
 
 // 对 Profile 中的 Fallback 组做地区重排
-function reorderFallbackGroups(profileText, regionScores) {
+// unlockDetails 格式: { HK: [{name: "Netflix", unlocked: true}, ...], ... }
+// minSpeedMbps/maxSpeedMbps: EMA 平滑后的速度范围，由主流程计算并传入
+function reorderFallbackGroups(profileText, regionScores, unlockDetails, minSpeedMbps, maxSpeedMbps) {
   const lines = profileText.split("\n");
   let inProxyGroup = false;
   let currentSection = "";
@@ -871,12 +911,50 @@ function reorderFallbackGroups(profileText, regionScores) {
       sortableRegions = regionMembers.filter(r => !config.exclude.includes(r));
     }
     
-    // 按分数排序（降序：分高优先）
-    sortableRegions.sort((a, b) => {
-      const scoreA = regionScores[a] ? calcRegionScore(regionScores[a], config.sortBy) : 0;
-      const scoreB = regionScores[b] ? calcRegionScore(regionScores[b], config.sortBy) : 0;
-      return scoreB - scoreA;
-    });
+    // 解锁一票否决：如果配置了 requiredUnlock，分为通过/未通过两组
+    let failed = [];
+    if (config.requiredUnlock && config.requiredUnlock.length > 0 && unlockDetails) {
+      const passed = [];
+      failed = [];
+      
+      for (const region of sortableRegions) {
+        const details = unlockDetails[region]; // [{name: "Netflix", unlocked: true}, ...]
+        // 检查是否有任一 required 服务解锁（OR 逻辑）
+        const hasRequired = config.requiredUnlock.some(serviceName =>
+          details && details.some(d => d.name === serviceName && d.unlocked)
+        );
+        if (hasRequired) {
+          passed.push(region);
+        } else {
+          failed.push(region);
+        }
+      }
+      
+      // 分别按分数排序，未通过的放后面
+      passed.sort((a, b) => {
+        const scoreA = regionScores[a] ? calcRegionScore(regionScores[a], config.sortBy, minSpeedMbps, maxSpeedMbps) : 0;
+        const scoreB = regionScores[b] ? calcRegionScore(regionScores[b], config.sortBy, minSpeedMbps, maxSpeedMbps) : 0;
+        return scoreB - scoreA;
+      });
+      failed.sort((a, b) => {
+        const scoreA = regionScores[a] ? calcRegionScore(regionScores[a], config.sortBy, minSpeedMbps, maxSpeedMbps) : 0;
+        const scoreB = regionScores[b] ? calcRegionScore(regionScores[b], config.sortBy, minSpeedMbps, maxSpeedMbps) : 0;
+        return scoreB - scoreA;
+      });
+      
+      sortableRegions = [...passed, ...failed];
+      
+      if (failed.length > 0) {
+        log("info", "Fallback", `${groupName} 解锁否决`, { passed, failed, required: config.requiredUnlock });
+      }
+    } else {
+      // 无 requiredUnlock 配置，按分数正常排序（降序：分高优先）
+      sortableRegions.sort((a, b) => {
+        const scoreA = regionScores[a] ? calcRegionScore(regionScores[a], config.sortBy, minSpeedMbps, maxSpeedMbps) : 0;
+        const scoreB = regionScores[b] ? calcRegionScore(regionScores[b], config.sortBy, minSpeedMbps, maxSpeedMbps) : 0;
+        return scoreB - scoreA;
+      });
+    }
     
     // 重组成员列表
     // 被 exclude 的地区不参与，也不保留在结果中
@@ -895,6 +973,13 @@ function reorderFallbackGroups(profileText, regionScores) {
     const prefix = lines[i].substring(0, eqIndex + 1);
     const newLine = `${prefix} ${policyType}, ${newMembers.join(", ")}${params.length > 0 ? ", " + params.join(", ") : ""}`;
     lines[i] = newLine;
+    
+    // 在重排行上方插入/更新 SmartSelector 注释
+    const now = new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+    const scoreStr = sortableRegions.map(r => `${r}(${(regionScores[r] ? calcRegionScore(regionScores[r], config.sortBy, minSpeedMbps, maxSpeedMbps) : 0).toFixed(2)})`).join(">");
+    const vetoInfo = failed.length > 0 ? ` | 否决:${failed.join(",")}` : "";
+    const fbComment = `# [SmartSelector] ${now} | ${scoreStr}${vetoInfo}`;
+    i += insertOrUpdateComment(lines, i, fbComment);
     
     log("info", "Fallback", "地区排序", { group: groupName, order: sortableRegions });
   }
@@ -1214,15 +1299,52 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
         latencyMs: avgLatency
       };
     }
-    log("info", "Main", "地区综合分", { scores: Object.fromEntries(Object.entries(regionScores).map(([r, s]) => [r, calcRegionScore(s, "overall").toFixed(3)])) });
+    // 计算本轮 min/max
+    const allSpeeds = Object.values(regionScores).map(s => s.speedMbps || 0).filter(s => s > 0);
+    const currentMax = allSpeeds.length > 0 ? Math.max(...allSpeeds) : 0;
+    const currentMin = allSpeeds.length > 0 ? Math.min(...allSpeeds) : 0;
+
+    // EMA 平滑 min/max（按网络类型存储）
+    const SPEED_RANGE_ALPHA = 0.7;  // 当前轮 70%，历史 30%
+    if (!history.speedRange) history.speedRange = {};
+    let minSpeedMbps, maxSpeedMbps;
+
+    if (allSpeeds.length > 0) {
+      // 有成功测速数据，更新 EMA
+      const prevRange = history.speedRange[networkType] || { emaMin: currentMin, emaMax: currentMax };
+      const emaMax = SPEED_RANGE_ALPHA * currentMax + (1 - SPEED_RANGE_ALPHA) * prevRange.emaMax;
+      const emaMin = SPEED_RANGE_ALPHA * currentMin + (1 - SPEED_RANGE_ALPHA) * prevRange.emaMin;
+      // 保存
+      history.speedRange[networkType] = { emaMin, emaMax };
+      // 防御边界：emaMax <= emaMin 时避免除零
+      minSpeedMbps = emaMin;
+      maxSpeedMbps = emaMax > emaMin ? emaMax : emaMin + 0.01;
+      log("info", "Main", "速度范围 EMA", { currentMin: currentMin.toFixed(2), currentMax: currentMax.toFixed(2), emaMin: emaMin.toFixed(2), emaMax: emaMax.toFixed(2), network: networkType });
+    } else {
+      // 本轮无成功测速数据，跳过 speedRange 更新，使用历史值或默认值
+      const prevRange = history.speedRange[networkType];
+      if (prevRange) {
+        minSpeedMbps = prevRange.emaMin;
+        maxSpeedMbps = prevRange.emaMax > prevRange.emaMin ? prevRange.emaMax : prevRange.emaMin + 0.01;
+      } else {
+        minSpeedMbps = 0;
+        maxSpeedMbps = 1;
+      }
+      log("info", "Main", "速度范围 EMA", { note: "本轮无测速数据，使用历史值", minSpeedMbps: minSpeedMbps.toFixed(2), maxSpeedMbps: maxSpeedMbps.toFixed(2), network: networkType });
+    }
+    log("info", "Main", "地区综合分", { scores: Object.fromEntries(Object.entries(regionScores).map(([r, s]) => [r, calcRegionScore(s, "overall", minSpeedMbps, maxSpeedMbps).toFixed(3)])) });
     
     // 8. 下载 Profile -> 更新 Smart 组权重 -> Fallback 重排 -> 上传 Gist
     log("info", "Main", "Profile 同步流程开始");
     const profile = await downloadProfile();
     // 8a. 更新 Smart 组的 policy-priority（只更新当前网络类型的 Smart 组）
-    const profileWithWeights = updateProfileWeights(profile, weightMap, networkSuffix);
-    // 8b. 对 Fallback 组做地区重排
-    const updatedProfile = reorderFallbackGroups(profileWithWeights, regionScores);
+    const profileWithWeights = updateProfileWeights(profile, weightMap, networkSuffix, regionScores, networkType);
+    // 8b. 对 Fallback 组做地区重排（传入各地区解锁详情，用于一票否决机制）
+    const unlockDetails = {};
+    for (const { region, unlockResult } of unlockResults) {
+      unlockDetails[region] = unlockResult.details;
+    }
+    const updatedProfile = reorderFallbackGroups(profileWithWeights, regionScores, unlockDetails, minSpeedMbps, maxSpeedMbps);
     
     if (CONFIG.DRY_RUN) {
       log("info", "DryRun", "跳过 Gist 上传", { regions: Object.keys(weightMap) });
