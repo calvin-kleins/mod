@@ -1,7 +1,7 @@
 #!name=流媒体 & AI 解锁检测
 #!desc=一键检测当前节点的流媒体和AI服务解锁状态（Netflix/YouTube/Disney+/Spotify/ChatGPT/Claude/Gemini/TikTok/Bilibili/HBO/Prime/DAZN/TVB）
 #!homepage=https://github.com/calvin-kleins/mod
-#!category=Panel
+#!category=CalvinKleins
 
 [Panel]
 流媒体检测 = script-name=流媒体检测,update-interval=7200,icon=play.tv.fill,icon-color=#06D6A0
