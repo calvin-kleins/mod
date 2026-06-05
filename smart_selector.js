@@ -126,26 +126,7 @@ function httpPatch(opts) {
   });
 }
 
-// ==================== 并发控制 ====================
-
-// 控制并发的 Promise 池
-async function asyncPool(limit, items, fn) {
-  const results = [];
-  const executing = new Set();
-  for (const item of items) {
-    const p = Promise.resolve().then(() => fn(item));
-    results.push(p);
-    executing.add(p);
-    const clean = () => executing.delete(p);
-    p.then(clean, clean);
-    if (executing.size >= limit) {
-      await Promise.race(executing);
-    }
-  }
-  return Promise.allSettled(results);
-}
-
-// ==================== Surge HTTP API 封装 ====================
+// ==================== Surge HTTP API 封装 ==
 
 // Promise 封装 $httpAPI
 function surgeAPI(method, path, body = null) {
@@ -198,16 +179,6 @@ async function getGroupMembers(groupName) {
   }
 }
 
-// 获取代理节点详情（含延迟）
-async function getProxyDetail(name) {
-  return await surgeAPI("GET", `/v1/policies/detail?policy_name=${encodeURIComponent(name)}`);
-}
-
-// 批量延迟测试
-async function testLatency(names) {
-  return await surgeAPI("POST", "/v1/policies/test", { policy_names: names });
-}
-
 // 从 /v1/policies/benchmark_results 获取所有节点的延迟数据
 async function getBenchmarkResults() {
   try {
@@ -231,17 +202,7 @@ function mapBenchmarkToNodes(benchmarkData, hashMap) {
   return latencyMap;
 }
 
-// 获取所有策略组
-async function getPolicyGroups() {
-  return await surgeAPI("GET", "/v1/policy_groups");
-}
-
-// 重载配置
-async function reloadProfile() {
-  await surgeAPI("POST", "/v1/profiles/reload");
-}
-
-// ==================== 网络类型检测 ====================
+// ==================== 网络类型检测 ==
 
 // 检测当前设备网络连接类型
 // 返回: "WiFi" | "有线" | "移动"
@@ -558,35 +519,7 @@ function recalculateAllScores(history) {
   }
 }
 
-// ==================== UCB1 选择与模型权重生成 ====================
-
-// UCB1 选择测试目标
-function selectTestTargets(history, nodes, region, count) {
-  const totalRounds = history.runCount || 1;
-  const now = Date.now();
-  
-  const scored = nodes
-    .filter(name => {
-      // 跳过处于冷却期的节点
-      const node = history.nodes[name];
-      if (node && node.cooldownUntil && now < node.cooldownUntil) return false;
-      return true;
-    })
-    .map(name => {
-      const node = history.nodes[name];
-      if (!node || node.totalTests === 0) {
-        return { name, ucb: Infinity }; // 未测试过优先
-      }
-      const ucb = ucb1Score(node.score, totalRounds, node.totalTests, 1.5);
-      return { name, ucb };
-    });
-  
-  // 按 UCB 分数降序
-  scored.sort((a, b) => b.ucb - a.ucb);
-  const selected = scored.slice(0, count).map(s => s.name);
-  log("debug", "ML", "UCB1选择", { region, selected });
-  return selected;
-}
+// ==================== 模型权重生成 ====================
 
 // 基于 ML 模型生成所有节点权重（含 EMA 平滑 + 权重上下限）
 function generateWeightsFromModel(history, regional, currentNetworkType) {
@@ -604,23 +537,43 @@ function generateWeightsFromModel(history, regional, currentNetworkType) {
   for (const [region, nodes] of Object.entries(regional)) {
     if (nodes.length === 0) continue;
     
-    // 计算原始权重
+    // 计算原始权重（含 UCB1 探索性调整 + 冷却降权）
     const rawEntries = nodes
       .map(name => {
         const node = history.nodes[name];
         if (!node) return null;
-        // score 高 -> weight 低 -> 优先级高
-        // score 范围 [0, 1] -> weight 映射到 [0.3, 3.0]
-        const weight = clamp(mapRange(node.score, 0, 1, 3.0, 0.3), 0.3, 3.0);
         
-        // 流量倍率惩罚：高倍率节点 weight 更大（weight 大 = 优先级低）
-        const multiplier = parseMultiplier(name);
-        const adjustedWeight = weight * multiplier;
-        if (multiplier > 1) {
-          log("debug", "ML", "流量倍率惩罚", { node: name, multiplier, originalWeight: weight.toFixed(2), adjustedWeight: adjustedWeight.toFixed(2) });
+        const totalRounds = history.runCount || 1;
+        const nodeTests = node.totalTests || 0;
+        
+        // 基础权重（score 高 → weight 低 → 优先级高）
+        let weight = clamp(mapRange(node.score, 0, 1, 3.0, 0.3), 0.3, 3.0);
+        
+        // UCB1 探索性调整：测试次数少时，权重向中间值(1.0)回归
+        // confidence = 1 - exploration_bonus（测试越多越自信）
+        if (nodeTests > 0 && totalRounds > 1) {
+          const exploration = Math.sqrt(Math.log(totalRounds) / nodeTests);
+          const confidence = Math.max(1 - exploration, 0.3); // 最低 30% 信心
+          weight = weight * confidence + 1.0 * (1 - confidence); // 向中间值 1.0 插值
+        } else if (nodeTests === 0) {
+          weight = 1.0; // 完全未测试，给中间权重（不奖不罚）
         }
         
-        return { name, weight: adjustedWeight };
+        // 冷却期降权
+        if (node.cooldownUntil && Date.now() < node.cooldownUntil) {
+          weight = 3.0; // 冷却期内直接最低优先级
+          log("debug", "ML", "冷却降权", { node: name });
+        }
+        
+        // 流量倍率惩罚：高倍率节点 weight 更大（weight 大 = 优先级低）
+        const rawMultiplier = parseMultiplier(name);
+        const multiplier = clamp(rawMultiplier, 0.75, 1.5);
+        weight = weight * multiplier;
+        if (multiplier > 1) {
+          log("debug", "ML", "流量倍率惩罚", { node: name, multiplier, weight: weight.toFixed(2) });
+        }
+        
+        return { name, weight };
       })
       .filter(Boolean);
     
@@ -703,29 +656,7 @@ function parseMultiplier(nodeName) {
   return match ? parseFloat(match[1]) : 1;
 }
 
-// 计算单个节点权重
-// unlockScore: 0-1, speedBps: bytes/s, latencyMs: ms, maxSpeedInGroup: bytes/s
-function calculateWeight(unlockScore, speedBps, latencyMs, maxSpeedInGroup) {
-  // 解锁系数: 有解锁=0.6, 不确定=1.0, 无解锁=2.5
-  const unlockFactor = unlockScore > 0 ? 0.6 
-                     : 2.5;
-  
-  // 速率系数: 归一化到 [0.5, 1.5]（速度越高系数越低=优先级越高）
-  const speedFactor = maxSpeedInGroup > 0 
-    ? mapRange(speedBps, 0, maxSpeedInGroup, 1.5, 0.5) 
-    : 1.0;
-  
-  // 延迟系数: <100ms=0.8, 100-300ms=1.0, >300ms=1.3
-  const latencyFactor = !latencyMs ? 1.0
-                       : latencyMs < 100 ? 0.8 
-                       : latencyMs < 300 ? 1.0 
-                       : 1.3;
-  
-  // 综合 (clamp 到 [0.3, 3.0])
-  return clamp(unlockFactor * speedFactor * latencyFactor, 0.3, 3.0);
-}
-
-// ==================== Profile 更新模块 ====================
+// ==================== Profile 更新模块 ==
 
 // 匹配 Smart 组所属地区（仅匹配组名，避免 URL/参数中的误匹配）
 function matchSmartGroupRegion(groupLine) {
@@ -1022,6 +953,71 @@ function reorderFallbackGroups(profileText, regionScores, unlockDetails, minSpee
   return lines.join("\n");
 }
 
+// ==================== Profile 摘要注入 ====================
+
+// 在配置文件顶部插入/更新运行摘要
+function insertProfileSummary(profileText, regionScores, weightMap, networkType, runCount) {
+  const now = new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+  
+  // 构建摘要行
+  const summaryLines = [`# [SmartSelector Summary]`];
+  summaryLines.push(`# 更新时间: ${now} | 网络: ${networkType} | 第${runCount}轮`);
+  
+  // 地区概览（每行最多2个地区）
+  const regions = Object.entries(regionScores);
+  for (let i = 0; i < regions.length; i += 2) {
+    const parts = regions.slice(i, i + 2).map(([r, s]) => 
+      `${r}: 解锁${s.unlock.toFixed(2)} 速度${s.speedMbps.toFixed(1)}Mbps 延迟${Math.round(s.latencyMs)}ms`
+    );
+    summaryLines.push(`# ${parts.join(" | ")}`);
+  }
+  
+  // 最优节点
+  const bestNodes = Object.entries(weightMap).map(([region, priorities]) => {
+    const nodes = priorities.split(";");
+    let bestNode = "", bestWeight = Infinity;
+    for (const entry of nodes) {
+      const lastColon = entry.lastIndexOf(":");
+      if (lastColon <= 0) continue;
+      const name = entry.substring(0, lastColon);
+      const w = parseFloat(entry.substring(lastColon + 1));
+      if (!Number.isFinite(w)) continue;
+      if (w < bestWeight) { bestWeight = w; bestNode = name; }
+    }
+    if (!Number.isFinite(bestWeight)) return `${region}=未知(--)`;
+    return `${region}=${bestNode}(${bestWeight.toFixed(2)})`;
+  });
+  summaryLines.push(`# 最优: ${bestNodes.join(" ")}`);
+  
+  // 移除旧摘要
+  const lines = profileText.split("\n");
+  let startIdx = -1, endIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim() === "# [SmartSelector Summary]") {
+      startIdx = i;
+      endIdx = i;
+      while (endIdx + 1 < lines.length && lines[endIdx + 1].trim().startsWith("#") && !lines[endIdx + 1].trim().startsWith("[" )) {
+        endIdx++;
+      }
+      break;
+    }
+  }
+  
+  if (startIdx >= 0) {
+    // 替换旧摘要
+    lines.splice(startIdx, endIdx - startIdx + 1, ...summaryLines);
+  } else {
+    // 在顶部插入（保留可能存在的 #!managed-config 行）
+    if (lines[0] && lines[0].startsWith("#!")) {
+      lines.splice(1, 0, ...summaryLines, "");
+    } else {
+      lines.splice(0, 0, ...summaryLines, "");
+    }
+  }
+  
+  return lines.join("\n");
+}
+
 // ==================== Gist 同步模块 ====================
 
 // 模块级变量：存储从 Gist API 自动发现的文件名
@@ -1123,8 +1119,11 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
     let bestNode = "";
     let bestWeight = Infinity;
     for (const entry of nodes) {
-      const [name, w] = entry.split(":");
-      const weight = parseFloat(w);
+      const lastColon = entry.lastIndexOf(":");
+      if (lastColon <= 0) continue;
+      const name = entry.substring(0, lastColon);
+      const weight = parseFloat(entry.substring(lastColon + 1));
+      if (!Number.isFinite(weight)) continue;
       if (weight < bestWeight) {
         bestWeight = weight;
         bestNode = name;
@@ -1382,10 +1381,13 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
     }
     const updatedProfile = reorderFallbackGroups(profileWithWeights, regionScores, unlockDetails, minSpeedMbps, maxSpeedMbps);
     
+    // 8c. 在配置顶部插入/更新运行摘要
+    const finalProfile = insertProfileSummary(updatedProfile, regionScores, weightMap, networkType, (history.runCount || 0) + 1);
+    
     if (CONFIG.DRY_RUN) {
       log("info", "DryRun", "跳过 Gist 上传", { regions: Object.keys(weightMap) });
     } else {
-      await uploadProfile(updatedProfile);
+      await uploadProfile(finalProfile);
       log("info", "Main", "Profile 同步完成");
     }
     
@@ -1411,7 +1413,24 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
       }
     }
     
-    // 10. 保存历史数据
+    // 10. 保存历史数据（先清理过期节点）
+    const HISTORY_RETENTION_DAYS = 7;
+    const retentionMs = HISTORY_RETENTION_DAYS * 86400000;
+    const currentNodes = new Set(Object.values(regional).flat());
+    const nowCleanup = Date.now();
+    for (const [name, node] of Object.entries(history.nodes)) {
+      if (!currentNodes.has(name) && node.lastTestTime && (nowCleanup - node.lastTestTime > retentionMs)) {
+        delete history.nodes[name];
+        // 同步清理各网络类型下的旧权重基线
+        if (history.regionWeights) {
+          for (const weights of Object.values(history.regionWeights)) {
+            if (weights && weights[name] !== undefined) delete weights[name];
+          }
+        }
+        log("debug", "Main", "清理过期节点", { name, lastTest: new Date(node.lastTestTime).toISOString() });
+      }
+    }
+    
     history.lastRun = new Date().toISOString();
     history.runCount = (history.runCount || 0) + 1;
     saveHistory(history);
