@@ -955,28 +955,67 @@ function reorderFallbackGroups(profileText, regionScores, unlockDetails, minSpee
 
 // ==================== Profile 摘要注入 ====================
 
-// 在配置文件顶部插入/更新运行摘要
-function insertProfileSummary(profileText, regionScores, weightMap, networkType, runCount) {
+// 在配置文件顶部插入/更新运行摘要（完全自举：所有数据从 history 提取）
+function insertProfileSummary(profileText, weightMap, networkType, history, regional) {
   const now = new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+  
+  // 所有数据从 history 提取
+  const runCount = history.runCount || 0;
+  const firstRun = history.firstRun || "未知";
+  const totalNodes = Object.keys(history.nodes).length;
   
   // 构建摘要行
   const summaryLines = [`# [SmartSelector Summary]`];
-  summaryLines.push(`# 更新时间: ${now} | 网络: ${networkType} | 第${runCount}轮`);
+  summaryLines.push(`# 更新时间: ${now} | 网络: ${networkType} | 第${runCount}轮 | 自${firstRun}起 | ${totalNodes}节点`);
   
-  // 地区概览（每行最多2个地区）
-  const regions = Object.entries(regionScores);
-  for (let i = 0; i < regions.length; i += 2) {
-    const parts = regions.slice(i, i + 2).map(([r, s]) => 
-      `${r}: 解锁${s.unlock.toFixed(2)} 速度${s.speedMbps.toFixed(1)}Mbps 延迟${Math.round(s.latencyMs)}ms`
-    );
-    summaryLines.push(`# ${parts.join(" | ")}`);
+  // 地区统计：从 history.nodes 按 regional 分组聚合
+  const regionSummaries = [];
+  const regionBests = [];
+  for (const [region, nodes] of Object.entries(regional || {})) {
+    const regionNodes = nodes
+      .map(name => history.nodes[name])
+      .filter(Boolean);
+    
+    if (regionNodes.length === 0) continue;
+    
+    // 聚合：取各节点 EMA 的均值
+    const avgLatency = regionNodes.reduce((s, n) => s + (n.emaLatency || 0), 0) / regionNodes.length;
+    const avgSpeed = regionNodes.reduce((s, n) => s + (n.emaSpeed || 0), 0) / regionNodes.length;
+    const avgUnlock = regionNodes.reduce((s, n) => s + getUnlockProbability(n.unlockAlpha || 1, n.unlockBeta || 1), 0) / regionNodes.length;
+    const totalTests = regionNodes.reduce((s, n) => s + (n.totalTests || 0), 0);
+    
+    // 格式化
+    regionSummaries.push(`${region}: 解锁${avgUnlock.toFixed(2)} 速度${(avgSpeed / 1048576).toFixed(1)}MB/s 延迟${Math.round(avgLatency)}ms (测${totalTests}次)`);
+    
+    // 找到该地区历史评分最高的节点
+    let bestName = "", bestScore = -1;
+    for (const name of nodes) {
+      const node = history.nodes[name];
+      if (node && node.score > bestScore) {
+        bestScore = node.score;
+        bestName = name;
+      }
+    }
+    if (bestName && bestScore > 0) {
+      regionBests.push(`${region}=${bestName}(${bestScore.toFixed(2)})`);
+    }
   }
   
-  // 最优节点
-  const bestNodes = Object.entries(weightMap).map(([region, priorities]) => {
-    const nodes = priorities.split(";");
+  // 地区概览（每行最多2个地区）
+  for (let i = 0; i < regionSummaries.length; i += 2) {
+    summaryLines.push(`# ${regionSummaries.slice(i, i + 2).join(" | ")}`);
+  }
+  
+  // 历史最优节点
+  if (regionBests.length > 0) {
+    summaryLines.push(`# 历史最优: ${regionBests.join(" ")}`);
+  }
+  
+  // 本轮权重最优节点（从 weightMap 取，权重最小 = 优先级最高）
+  const currentBests = Object.entries(weightMap).map(([region, priorities]) => {
+    const entries = priorities.split(";");
     let bestNode = "", bestWeight = Infinity;
-    for (const entry of nodes) {
+    for (const entry of entries) {
       const lastColon = entry.lastIndexOf(":");
       if (lastColon <= 0) continue;
       const name = entry.substring(0, lastColon);
@@ -987,7 +1026,7 @@ function insertProfileSummary(profileText, regionScores, weightMap, networkType,
     if (!Number.isFinite(bestWeight)) return `${region}=未知(--)`;
     return `${region}=${bestNode}(${bestWeight.toFixed(2)})`;
   });
-  summaryLines.push(`# 最优: ${bestNodes.join(" ")}`);
+  summaryLines.push(`# 本轮权重: ${currentBests.join(" ")}`);
   
   // 移除旧摘要
   const lines = profileText.split("\n");
@@ -1381,8 +1420,14 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
     }
     const updatedProfile = reorderFallbackGroups(profileWithWeights, regionScores, unlockDetails, minSpeedMbps, maxSpeedMbps);
     
-    // 8c. 在配置顶部插入/更新运行摘要
-    const finalProfile = insertProfileSummary(updatedProfile, regionScores, weightMap, networkType, (history.runCount || 0) + 1);
+    // 8c. 先更新轮次和首次时间（摘要需要读取这些值）
+    if (!history.firstRun) {
+      history.firstRun = new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false, month: "2-digit", day: "2-digit" });
+    }
+    history.runCount = (history.runCount || 0) + 1;
+
+    // 生成摘要（此时 history 中的轮次和首次时间已是最新）
+    const finalProfile = insertProfileSummary(updatedProfile, weightMap, networkType, history, regional);
     
     if (CONFIG.DRY_RUN) {
       log("info", "DryRun", "跳过 Gist 上传", { regions: Object.keys(weightMap) });
@@ -1431,8 +1476,8 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
       }
     }
     
+    // 保存历史数据
     history.lastRun = new Date().toISOString();
-    history.runCount = (history.runCount || 0) + 1;
     saveHistory(history);
     
     // 11. Panel 输出
