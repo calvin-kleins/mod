@@ -42,14 +42,16 @@ const CONFIG = {
     TW: "TW",
     JP: "JP",
     SG: "SG",
-    US: "US"
+    US: "US",
+    KR: "KR"
   },
   REGION_PATTERNS: {
     HK: /香港|HK|Hong\s?Kong|🇭🇰/i,
     TW: /台湾|TW|Taiwan|🇹🇼/i,
     JP: /日本|JP|Japan|🇯🇵/i,
     SG: /新加坡|SG|Singapore|🇸🇬/i,
-    US: /美国|US|United\s?States|🇺🇸/i
+    US: /美国|US|United\s?States|🇺🇸/i,
+    KR: /韩国|KR|Korea|🇰🇷/i
   }
 };
 
@@ -236,6 +238,12 @@ function detectNetworkType() {
 
 // ==================== 解锁检测模块 ====================
 
+// 解锁分类：定义哪些服务属于哪个类别
+const UNLOCK_CATEGORIES = {
+  streaming: ["Netflix", "Disney+"],    // 流媒体
+  aigc: ["Gemini", "ChatGPT"],          // AI 服务
+};
+
 const UNLOCK_TARGETS = {
   HK: [
     { name: "Netflix", url: "https://www.netflix.com/title/81280792", check: (status, body) => status === 200 || status === 301 },
@@ -262,6 +270,11 @@ const UNLOCK_TARGETS = {
     { name: "Disney+", url: "https://www.disneyplus.com/", check: (status, body) => status >= 200 && status < 400 },
     { name: "Gemini", url: "https://gemini.google.com/", check: (status, body) => status >= 200 && status < 400 },
     { name: "ChatGPT", url: "https://ios.chat.openai.com/public-api/mobile/server_status/v1", check: (status, body) => status === 200 }
+  ],
+  KR: [
+    { name: "Netflix", url: "https://www.netflix.com/title/81280792", check: (status, body) => status === 200 || status === 301 },
+    { name: "Disney+", url: "https://www.disneyplus.com/", check: (status, body) => status >= 200 && status < 400 },
+    { name: "Gemini", url: "https://gemini.google.com/", check: (status, body) => status >= 200 && status < 400 }
   ]
 };
 
@@ -303,6 +316,7 @@ const SPEED_TEST_FILES = {
   JP: { url: "http://cachefly.cachefly.net/2mb.test", size: 2097152 },
   SG: { url: "http://cachefly.cachefly.net/2mb.test", size: 2097152 },
   US: { url: "http://cachefly.cachefly.net/2mb.test", size: 2097152 },
+  KR: { url: "http://cachefly.cachefly.net/2mb.test", size: 2097152 },
   DEFAULT: { url: "http://cachefly.cachefly.net/2mb.test", size: 2097152 }
 };
 
@@ -383,7 +397,8 @@ function calculateNodeScore(node) {
                    : 0.1;                      // 基本不解锁 → 重惩罚
 
   // 速率和延迟的质量分
-  const qualityScore = speedScore * 0.6 + latencyScore * 0.4;
+  // 带宽为王：速度占 70%，延迟占 30%
+  const qualityScore = speedScore * 0.7 + latencyScore * 0.3;
 
   // 最终评分 = 门控 × 质量分
   const raw = unlockGate * qualityScore;
@@ -403,6 +418,13 @@ function loadHistory() {
       if (node.consecutiveFailures === undefined) node.consecutiveFailures = 0;
       if (node.lastSpeedVariance === undefined) node.lastSpeedVariance = 0;
       if (node.cooldownUntil === undefined) node.cooldownUntil = 0;
+      // 兼容旧版：从统一 unlockAlpha/unlockBeta 迁移到按分类存储
+      if (node.unlockByCategory === undefined) {
+        node.unlockByCategory = {
+          streaming: { alpha: node.unlockAlpha || 1, beta: node.unlockBeta || 1 },
+          aigc: { alpha: node.unlockAlpha || 1, beta: node.unlockBeta || 1 },
+        };
+      }
     }
     return history;
   } catch (e) {
@@ -425,6 +447,12 @@ function initNodeHistory(history, name, regional) {
     region,
     emaSpeed: null,
     emaLatency: null,
+    // 解锁记录按分类存储
+    unlockByCategory: {
+      streaming: { alpha: 1, beta: 1 },  // 流媒体解锁 Beta 分布
+      aigc: { alpha: 1, beta: 1 },       // AIGC 解锁 Beta 分布
+    },
+    // 保留旧字段兼容（向后兼容）
     unlockAlpha: 1,
     unlockBeta: 1,
     totalTests: 0,
@@ -490,20 +518,35 @@ function updateNodeHistory(history, result) {
     node.consecutiveFailures = 0;
   }
   
-  // Beta 分布更新（带防抖：只有连续失败达到阈值才降低解锁评分）
-  if (unlocked) {
-    const beta = updateBetaDistribution(node.unlockAlpha, node.unlockBeta, true);
-    node.unlockAlpha = beta.alpha;
-    node.unlockBeta = beta.beta;
+  // --- 按分类更新解锁 Beta 分布 ---
+  if (result.unlockDetails && result.unlockDetails.length > 0) {
+    for (const [category, serviceNames] of Object.entries(UNLOCK_CATEGORIES)) {
+      if (!node.unlockByCategory[category]) {
+        node.unlockByCategory[category] = { alpha: 1, beta: 1 };
+      }
+      // 检查该分类下是否有任一服务解锁成功
+      const categoryUnlocked = serviceNames.some(svc =>
+        result.unlockDetails.some(d => d.name === svc && d.unlocked)
+      );
+      
+      // 防抖逻辑仍适用
+      if (categoryUnlocked) {
+        node.unlockByCategory[category].alpha += 1;
+      } else if (node.consecutiveFailures >= CONFIG.DEBOUNCE_WINDOW) {
+        node.unlockByCategory[category].beta += 1;
+      }
+    }
+  }
+
+  // 保持旧的统一 unlockAlpha/unlockBeta 也同步更新（兼容 calculateNodeScore 的门控）
+  const anyUnlocked = (result.unlockScore || 0) > 0;
+  if (anyUnlocked) {
+    node.unlockAlpha += 1;
   } else if (node.consecutiveFailures >= CONFIG.DEBOUNCE_WINDOW) {
-    // 连续失败达到防抖窗口，才真正更新 Beta 分布的失败计数
-    const beta = updateBetaDistribution(node.unlockAlpha, node.unlockBeta, false);
-    node.unlockAlpha = beta.alpha;
-    node.unlockBeta = beta.beta;
-  } else if (!unlocked) {
+    node.unlockBeta += 1;
+  } else if (!anyUnlocked) {
     log("debug", "Debounce", "防抖生效-跳过Beta更新", { node: result.proxyName });
   }
-  // 单次失败不更新 Beta 分布，等待后续结果确认
   
   // --- 冷却期触发 ---
   if (node.consecutiveFailures >= CONFIG.COOLDOWN_TRIGGER_FAILURES) {
@@ -557,6 +600,19 @@ function generateWeightsFromModel(history, regional, currentNetworkType) {
           weight = weight * confidence + 1.0 * (1 - confidence); // 向中间值 1.0 插值
         } else if (nodeTests === 0) {
           weight = 1.0; // 完全未测试，给中间权重（不奖不罚）
+        }
+        
+        // 解锁一票否决：所有分类都不解锁才否决（AND 语义）
+        // 只要还能服务某个业务（流媒体或AIGC），节点就有存在价值
+        if (node.totalTests >= 2 && node.unlockByCategory) {
+          const allFailed = Object.values(node.unlockByCategory).every(beta => {
+            const prob = getUnlockProbability(beta.alpha || 1, beta.beta || 1);
+            return prob <= 0.1;
+          });
+          if (allFailed) {
+            weight = 3.0;
+            log("debug", "ML", "全分类解锁否决", { node: name });
+          }
         }
         
         // 冷却期降权
@@ -756,13 +812,13 @@ function updateProfileWeights(profileText, weightMap, suffix, regionScores, netw
 // Fallback 组重排配置
 const FALLBACK_REORDER_CONFIG = {
   "代理容灾": { exclude: [], sortBy: "overall" },
-  "Google容灾": { exclude: [], sortBy: "latency" },
-  "Netflix容灾": { exclude: [], sortBy: "unlock", requiredUnlock: ["Netflix"] },
-  "流媒体容灾": { exclude: [], sortBy: "unlock", requiredUnlock: ["Netflix", "Disney+"] },
+  "Google容灾": { exclude: [], sortBy: "overall" },
+  "Netflix容灾": { exclude: [], sortBy: "overall", requiredUnlock: ["Netflix"] },
+  "流媒体容灾": { exclude: [], sortBy: "overall" },
   "AIGC容灾": { exclude: ["HK"], sortBy: "overall", requiredUnlock: ["Gemini", "ChatGPT"] },
   "游戏容灾": { exclude: ["US", "TW"], sortBy: "latency", suffix: ["DIRECT"] },
-  "TG容灾": { exclude: [], sortBy: "latency" },
-  "Apple容灾": { regions: ["HK", "US", "JP"], sortBy: "latency" },
+  "TG容灾": { exclude: [], sortBy: "overall" },
+  "Apple容灾": { regions: ["HK", "US", "JP", "KR"], sortBy: "overall" },
 };
 
 // 计算地区综合分
@@ -779,14 +835,14 @@ function calcRegionScore(regionData, sortBy, minSpeedMbps, maxSpeedMbps) {
   const latencyNorm = 1 - Math.min(latency / 500, 1);    // 500ms 零分
   
   if (sortBy === "latency") {
-    // 延迟优先：延迟占 60%，速度 25%，解锁 15%
-    return latencyNorm * 0.6 + speedNorm * 0.25 + unlock * 0.15;
+    // 延迟优先（游戏等延迟敏感场景）：延迟占 50%，速度 35%，解锁 15%
+    return latencyNorm * 0.5 + speedNorm * 0.35 + unlock * 0.15;
   } else if (sortBy === "unlock") {
-    // 解锁优先：解锁占 50%，速度 30%，延迟 20%
-    return unlock * 0.5 + speedNorm * 0.3 + latencyNorm * 0.2;
+    // 解锁优先：解锁占 45%，速度 40%，延迟 15%
+    return unlock * 0.45 + speedNorm * 0.4 + latencyNorm * 0.15;
   } else {
-    // overall 综合分
-    return unlock * 0.3 + speedNorm * 0.4 + latencyNorm * 0.3;
+    // overall 综合分（带宽为王）：速度占 50%，解锁 30%，延迟 20%
+    return speedNorm * 0.5 + unlock * 0.3 + latencyNorm * 0.2;
   }
 }
 
