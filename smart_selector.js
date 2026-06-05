@@ -565,9 +565,10 @@ function generateWeightsFromModel(history, regional, currentNetworkType) {
           log("debug", "ML", "冷却降权", { node: name });
         }
         
-        // 流量倍率惩罚：高倍率节点 weight 更大（weight 大 = 优先级低）
+        // 流量倍率微弱参考：仅作轻微调节，不主导权重
+        // 0.1x节点→0.9（微弱提优），2x节点→1.1（微弱降优）
         const rawMultiplier = parseMultiplier(name);
-        const multiplier = clamp(rawMultiplier, 0.75, 1.5);
+        const multiplier = clamp(rawMultiplier, 0.9, 1.1);
         weight = weight * multiplier;
         if (multiplier > 1) {
           log("debug", "ML", "流量倍率惩罚", { node: name, multiplier, weight: weight.toFixed(2) });
@@ -1146,34 +1147,40 @@ async function uploadProfile(content) {
 
 // ==================== Panel 格式化 ====================
 
-// 格式化 Panel 输出内容
-function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownCount) {
+// 格式化 Panel 输出内容（自举设计：从 history 提取历史累积数据）
+function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownCount, history, regional) {
   let output = "";
   let totalNodes = 0;
   
   for (const [region, priorities] of Object.entries(weightMap)) {
     const nodes = priorities.split(";");
     totalNodes += nodes.length;
-    // 找到该地区最优节点（权重最小）
-    let bestNode = "";
-    let bestWeight = Infinity;
+    
+    // 本轮最优节点（权重最小）
+    let bestNode = "", bestWeight = Infinity;
     for (const entry of nodes) {
       const lastColon = entry.lastIndexOf(":");
       if (lastColon <= 0) continue;
       const name = entry.substring(0, lastColon);
       const weight = parseFloat(entry.substring(lastColon + 1));
       if (!Number.isFinite(weight)) continue;
-      if (weight < bestWeight) {
-        bestWeight = weight;
-        bestNode = name;
-      }
+      if (weight < bestWeight) { bestWeight = weight; bestNode = name; }
     }
-    output += `${region}: ${bestNode}(${bestWeight.toFixed(1)})\n`;
+    
+    // 从 history 获取该地区历史平均 EMA 延迟
+    const regionNodes = (regional[region] || []).map(n => history.nodes[n]).filter(Boolean);
+    const avgLatency = regionNodes.length > 0 
+      ? Math.round(regionNodes.reduce((s, n) => s + (n.emaLatency || 0), 0) / regionNodes.length)
+      : "?";
+    
+    if (bestNode) {
+      output += `${region}: ${bestNode} ${avgLatency}ms\n`;
+    }
   }
   
   const mode = isColdStart ? "🆕冷启动" : `🧠第${runCount}轮`;
-  const cooldownInfo = cooldownCount > 0 ? ` | ${cooldownCount}节点冷却中` : "";
-  output += `${mode} | 共${totalNodes}节点${cooldownInfo} | ${duration}s`;
+  const cooldownInfo = cooldownCount > 0 ? ` | ${cooldownCount}冷却` : "";
+  output += `${mode} | ${totalNodes}节点${cooldownInfo} | ${duration}s`;
   return output;
 }
 
@@ -1485,7 +1492,7 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
     // 统计处于冷却期的节点数
     const now = Date.now();
     const cooldownCount = Object.values(history.nodes).filter(n => n.cooldownUntil && now < n.cooldownUntil).length;
-    panel.content = formatPanelOutput(weightMap, duration, isColdStart, history.runCount, cooldownCount);
+    panel.content = formatPanelOutput(weightMap, duration, isColdStart, history.runCount, cooldownCount, history, regional);
     panel["icon-color"] = "#4CD964";
     if (CONFIG.DRY_RUN) {
       panel.content = "🧪 DRY RUN 模式\n" + panel.content;
