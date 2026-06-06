@@ -39,6 +39,7 @@ const CONFIG = {
   PRECISE_TEST_COUNT: 3,   // 每地区精确测试的节点数
   NODE_SWITCH_DELAY: 500,  // 切换节点后的等待时间（ms）
   PROXY_POLICY: "节点选择",  // 用于外部请求（GitHub API等）的代理策略名
+  TEST_GROUP: "速度测试",  // 用于逐节点精确测试的 select 组（不影响用户活跃连接）
   REGION_GROUPS: {
     HK: "HK",
     TW: "TW",
@@ -358,19 +359,20 @@ async function testRegionSpeed(region, smartGroupName) {
 
 // ==================== 综合测试（已重构为地区级）====================
 
-// 逐节点精确测试：切换 Smart 组选中节点 → 测速+解锁 → 返回结果
-async function testSingleNode(nodeName, smartGroupName, region) {
+// 逐节点精确测试：切换"速度测试"select 组到目标节点 → 测速+解锁 → 返回结果
+// 使用独立的 select 组作为测试通道，不影响 Smart 组的自动选择和用户活跃连接
+async function testSingleNode(nodeName, region) {
   try {
-    // 1. 切换 Smart 组到指定节点
-    await switchGroupPolicy(smartGroupName, nodeName);
+    // 1. 切换"速度测试"select 组到指定节点（不影响 Smart 组的自动选择）
+    await switchGroupPolicy(CONFIG.TEST_GROUP, nodeName);
     
     // 2. 等待切换生效
     await new Promise(r => setTimeout(r, CONFIG.NODE_SWITCH_DELAY));
     
-    // 3. 并行执行解锁检测和测速（通过 Smart 组路由）
+    // 3. 并行执行解锁检测和测速（通过"速度测试"组路由）
     const [unlockResult, speedResult] = await Promise.all([
-      checkRegionUnlock(region, smartGroupName),
-      testRegionSpeed(region, smartGroupName)
+      checkRegionUnlock(region, CONFIG.TEST_GROUP),
+      testRegionSpeed(region, CONFIG.TEST_GROUP)
     ]);
     
     log("info", "Test", `${nodeName} 精确测试完成`, {
@@ -1458,14 +1460,31 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
     const regionResults = {};
 
     if (!CONFIG.DRY_RUN) {
+      // 记录测试组的原始选择，测试结束后恢复
+      let originalTestGroupPolicy = "DIRECT"; // 默认值
+      try {
+        const testGroupData = await surgeAPI("GET", `/v1/policy_groups/select?group_name=${encodeURIComponent(CONFIG.TEST_GROUP)}`);
+        if (testGroupData && testGroupData.policy) {
+          originalTestGroupPolicy = testGroupData.policy;
+        }
+        log("debug", "Main", "记录测试组原始选择", { policy: originalTestGroupPolicy });
+      } catch (e) {
+        log("debug", "Main", "获取测试组原始选择失败，将恢复为DIRECT", { error: e.message });
+      }
+
       // 对每地区 UCB1 Top-N 节点做逐节点精确测试
       for (const [region, data] of activeRegionEntries) {
         const targets = selectPreciseTestTargets(history, data.nodes, region, CONFIG.PRECISE_TEST_COUNT);
+        if (targets.length === 0) {
+          log("info", "Main", `${region} 全部节点处于冷却期，跳过本轮`);
+          regionResults[region] = [];
+          continue;
+        }
         log("info", "Main", `${region} 精确测试目标`, { targets });
         
         const preciseResults = [];
         for (const nodeName of targets) {
-          const result = await testSingleNode(nodeName, data.smartGroup, region);
+          const result = await testSingleNode(nodeName, region);
           // 补充 benchmark 延迟
           result.latency = regionLatencies[region] ? regionLatencies[region][nodeName] || null : null;
           preciseResults.push(result);
@@ -1493,26 +1512,13 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
         for (const result of regionResults[region]) {
           updateNodeHistory(history, result);
         }
-      }
-      
-      // 4b. 恢复 Smart 组（选择当前评分最高的节点）
-      for (const [region, data] of activeRegionEntries) {
+        
+        // 恢复"速度测试"组到原始选择（测试通道复位，不干预 Smart 组自动选择）
         try {
-          // 找到该地区评分最高的节点
-          let bestNode = "", bestScore = -1;
-          for (const name of data.nodes) {
-            const node = history.nodes[name];
-            if (node && node.score > bestScore) {
-              bestScore = node.score;
-              bestNode = name;
-            }
-          }
-          if (bestNode) {
-            await switchGroupPolicy(data.smartGroup, bestNode);
-            log("info", "Main", `${region} 恢复选择`, { node: bestNode, score: bestScore.toFixed(3) });
-          }
+          await switchGroupPolicy(CONFIG.TEST_GROUP, originalTestGroupPolicy);
+          log("info", "Main", `${region} 测试完成，测试通道已恢复`, { restored: originalTestGroupPolicy });
         } catch (e) {
-          log("warn", "Main", `${region} 恢复选择失败`, { error: e.message });
+          log("warn", "Main", `${region} 测试通道恢复失败`, { error: e.message });
         }
       }
     } else {
