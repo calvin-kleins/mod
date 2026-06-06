@@ -28,8 +28,8 @@ const CONFIG = {
   GIST_ID: args.gist_id || $persistentStore.read("smart_selector_gist_id") || "",
   CONCURRENCY: 3,
   SPEED_TIMEOUT: 10000,
-  UNLOCK_TIMEOUT: 5000,
-  SPEED_FILE_SIZE: 2097152, // 2MB
+  UNLOCK_TIMEOUT: 3000,
+  SPEED_FILE_SIZE: 1048576, // 1MB
   // 网络防抖配置
   DEBOUNCE_WINDOW: 2,          // 连续失败次数阈值，连续 N 次结果一致才更新评分
   OUTLIER_THRESHOLD: 2.0,      // 离群值检测倍数，偏差超过 N 倍标准差时降低更新权重
@@ -37,7 +37,7 @@ const CONFIG = {
   COOLDOWN_DURATION: 1800000,  // 冷却时长 30 分钟
   COOLDOWN_TRIGGER_FAILURES: 3, // 触发冷却的连续失败次数
   PRECISE_TEST_COUNT: 3,   // 每地区精确测试的节点数
-  NODE_SWITCH_DELAY: 500,  // 切换节点后的等待时间（ms）
+  NODE_SWITCH_DELAY: 200,  // 切换节点后的等待时间（ms）- select 组切换几乎即时
   PROXY_POLICY: "节点选择",  // 用于外部请求（GitHub API等）的代理策略名
   TEST_GROUP: "速度测试",  // 用于逐节点精确测试的 select 组（不影响用户活跃连接）
   REGION_GROUPS: {
@@ -323,13 +323,13 @@ async function checkRegionUnlock(region, smartGroupName) {
 // ==================== 测速模块 ====================
 
 const SPEED_TEST_FILES = {
-  HK: { url: "http://cachefly.cachefly.net/2mb.test", size: 2097152 },
-  TW: { url: "http://cachefly.cachefly.net/2mb.test", size: 2097152 },
-  JP: { url: "http://cachefly.cachefly.net/2mb.test", size: 2097152 },
-  SG: { url: "http://cachefly.cachefly.net/2mb.test", size: 2097152 },
-  US: { url: "http://cachefly.cachefly.net/2mb.test", size: 2097152 },
-  KR: { url: "http://cachefly.cachefly.net/2mb.test", size: 2097152 },
-  DEFAULT: { url: "http://cachefly.cachefly.net/2mb.test", size: 2097152 }
+  HK: { url: "http://cachefly.cachefly.net/1mb.test", size: 1048576 },
+  TW: { url: "http://cachefly.cachefly.net/1mb.test", size: 1048576 },
+  JP: { url: "http://cachefly.cachefly.net/1mb.test", size: 1048576 },
+  SG: { url: "http://cachefly.cachefly.net/1mb.test", size: 1048576 },
+  US: { url: "http://cachefly.cachefly.net/1mb.test", size: 1048576 },
+  KR: { url: "http://cachefly.cachefly.net/1mb.test", size: 1048576 },
+  DEFAULT: { url: "http://cachefly.cachefly.net/1mb.test", size: 1048576 }
 };
 
 
@@ -1436,11 +1436,20 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
         log("debug", "Main", `${region} 组延迟测试触发失败`, { error: e.message });
       }
     }
-    // 等待延迟测试完成
-    await new Promise(r => setTimeout(r, 3000));
+    // 自适应等待 benchmark 更新（最多 3s，数据有变化即提前继续）
+    const _benchBefore = await getBenchmarkResults();
+    const _beforeKeys = Object.keys(_benchBefore);
+    const _beforeTesting = _beforeKeys.filter(k => _benchBefore[k] && _benchBefore[k].testing === 1).length;
 
-    // 3b. 获取最新 benchmark 数据
-    const benchmarkData = await getBenchmarkResults();
+    let benchmarkData = _benchBefore;
+    for (let _poll = 0; _poll < 6; _poll++) {
+      await new Promise(r => setTimeout(r, 500));
+      benchmarkData = await getBenchmarkResults();
+      const currentKeys = Object.keys(benchmarkData);
+      const currentTesting = currentKeys.filter(k => benchmarkData[k] && benchmarkData[k].testing === 1).length;
+      // 如果 testing 数量减少（测试完成），提前退出
+      if (currentTesting < _beforeTesting) break;
+    }
     log("info", "Main", "Benchmark 数据刷新完成", { entries: Object.keys(benchmarkData).length });
 
     // 映射延迟到节点
