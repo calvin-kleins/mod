@@ -36,6 +36,8 @@ const CONFIG = {
   // 冷却期配置
   COOLDOWN_DURATION: 1800000,  // 冷却时长 30 分钟
   COOLDOWN_TRIGGER_FAILURES: 3, // 触发冷却的连续失败次数
+  PRECISE_TEST_COUNT: 3,   // 每地区精确测试的节点数
+  NODE_SWITCH_DELAY: 500,  // 切换节点后的等待时间（ms）
   PROXY_POLICY: "节点选择",  // 用于外部请求（GitHub API等）的代理策略名
   REGION_GROUPS: {
     HK: "HK",
@@ -145,6 +147,15 @@ function surgeAPI(method, path, body = null) {
       }
     });
   });
+}
+
+// 临时切换 Smart/select 组的选中节点
+async function switchGroupPolicy(groupName, policyName) {
+  await surgeAPI("POST", "/v1/policy_groups/select", { 
+    group_name: groupName, 
+    policy: policyName 
+  });
+  log("debug", "API", "切换节点", { group: groupName, policy: policyName });
 }
 
 // 缓存策略组数据（避免多次调用同一端点）
@@ -347,7 +358,75 @@ async function testRegionSpeed(region, smartGroupName) {
 
 // ==================== 综合测试（已重构为地区级）====================
 
+// 逐节点精确测试：切换 Smart 组选中节点 → 测速+解锁 → 返回结果
+async function testSingleNode(nodeName, smartGroupName, region) {
+  try {
+    // 1. 切换 Smart 组到指定节点
+    await switchGroupPolicy(smartGroupName, nodeName);
+    
+    // 2. 等待切换生效
+    await new Promise(r => setTimeout(r, CONFIG.NODE_SWITCH_DELAY));
+    
+    // 3. 并行执行解锁检测和测速（通过 Smart 组路由）
+    const [unlockResult, speedResult] = await Promise.all([
+      checkRegionUnlock(region, smartGroupName),
+      testRegionSpeed(region, smartGroupName)
+    ]);
+    
+    log("info", "Test", `${nodeName} 精确测试完成`, {
+      unlock: unlockResult.unlockScore.toFixed(2),
+      speed: speedResult ? (speedResult.speedBps / 1048576).toFixed(2) + "MB/s" : "失败"
+    });
+    
+    return {
+      proxyName: nodeName,
+      region,
+      latency: null, // 由 benchmark 补充
+      unlockScore: unlockResult.unlockScore,
+      unlockDetails: unlockResult.details,
+      speedBps: speedResult ? speedResult.speedBps : 0,
+      speedElapsed: speedResult ? speedResult.elapsed : null
+    };
+  } catch (e) {
+    log("warn", "Test", `${nodeName} 精确测试失败`, { error: e.message });
+    return {
+      proxyName: nodeName,
+      region,
+      latency: null,
+      unlockScore: 0,
+      unlockDetails: [],
+      speedBps: 0,
+      speedElapsed: null
+    };
+  }
+}
+
 // ==================== ML 算法模块 ====================
+
+// UCB1 选择精确测试目标（每地区 Top-N）
+function selectPreciseTestTargets(history, nodes, region, count) {
+  const totalRounds = history.runCount || 1;
+  const now = Date.now();
+  
+  const scored = nodes
+    .filter(name => {
+      const node = history.nodes[name];
+      // 跳过冷却期节点
+      if (node && node.cooldownUntil && now < node.cooldownUntil) return false;
+      return true;
+    })
+    .map(name => {
+      const node = history.nodes[name];
+      if (!node || node.totalTests === 0) return { name, ucb: Infinity }; // 未测试优先
+      const exploration = Math.sqrt(Math.log(totalRounds) / node.totalTests);
+      return { name, ucb: node.score + 1.5 * exploration };
+    });
+  
+  scored.sort((a, b) => b.ucb - a.ucb);
+  const selected = scored.slice(0, count).map(s => s.name);
+  log("debug", "ML", "UCB1精确测试选择", { region, selected, totalCandidates: scored.length });
+  return selected;
+}
 
 // EMA（指数移动平均）- alpha 越大，新数据权重越高
 function updateEMA(oldEMA, newValue, alpha = 0.3) {
@@ -1336,10 +1415,6 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
     const totalNodes = activeRegions.reduce((sum, [_, nodes]) => sum + nodes.length, 0);
     log("info", "Main", "获取代理节点", { total: totalNodes, regions: activeRegions.map(r => r[0]) });
     
-    // 3. 获取 benchmark 延迟数据（逐节点，通过 lineHash 映射）
-    const benchmarkData = await getBenchmarkResults();
-    log("info", "Main", "Benchmark 数据获取完成", { entries: Object.keys(benchmarkData).length });
-    
     // 确保所有节点有历史记录
     for (const [region, data] of Object.entries(regionData)) {
       for (const name of data.nodes) {
@@ -1347,65 +1422,131 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
       }
     }
     
-    // 4. 对每个地区执行解锁检测和测速（通过 Smart 组级路由）
-    const regionResults = {};
-    
-    // 预处理：映射延迟数据到各地区节点
+    // 3. 分层测试：精确测试 Top-N + 地区级测试兆底
+    const activeRegionEntries = Object.entries(regionData).filter(([_, data]) => data.nodes.length > 0);
+
+    // 3a. 触发 Surge 内置组延迟测试（获取最新可用节点）
+    for (const [region, data] of activeRegionEntries) {
+      try {
+        await surgeAPI("POST", "/v1/policy_groups/test", { group_name: data.smartGroup });
+        log("debug", "Main", `${region} 触发组延迟测试`);
+      } catch (e) {
+        log("debug", "Main", `${region} 组延迟测试触发失败`, { error: e.message });
+      }
+    }
+    // 等待延迟测试完成
+    await new Promise(r => setTimeout(r, 3000));
+
+    // 3b. 获取最新 benchmark 数据
+    const benchmarkData = await getBenchmarkResults();
+    log("info", "Main", "Benchmark 数据刷新完成", { entries: Object.keys(benchmarkData).length });
+
+    // 映射延迟到节点
     const regionLatencies = {};
     for (const [region, data] of Object.entries(regionData)) {
       if (data.nodes.length === 0) continue;
-      const nodeLatencies = mapBenchmarkToNodes(benchmarkData, data.hashMap);
-      regionLatencies[region] = nodeLatencies;
-      log("debug", "Main", `${region} 延迟映射`, { mapped: Object.keys(nodeLatencies).length, total: data.nodes.length });
-      
-      // 更新历史中的延迟 EMA
-      for (const [name, lat] of Object.entries(nodeLatencies)) {
+      regionLatencies[region] = mapBenchmarkToNodes(benchmarkData, data.hashMap);
+      // 更新 EMA 延迟
+      for (const [name, lat] of Object.entries(regionLatencies[region])) {
         if (history.nodes[name]) {
           history.nodes[name].emaLatency = updateEMA(history.nodes[name].emaLatency, lat);
         }
       }
     }
-    
-    // 阶段1：所有地区的解锁检测并行执行（各地区走不同代理节点，互不影响）
-    const activeRegionEntries = Object.entries(regionData).filter(([_, data]) => data.nodes.length > 0);
-    const unlockResults = await Promise.all(
-      activeRegionEntries.map(async ([region, data]) => {
-        const unlockResult = await checkRegionUnlock(region, data.smartGroup);
-        log("info", "Unlock", `${region} 解锁检测`, { score: unlockResult.unlockScore, details: unlockResult.details });
-        return { region, unlockResult };
-      })
-    );
-    
-    // 构建解锁结果映射：region -> unlockResult
-    const unlockMap = {};
-    for (const { region, unlockResult } of unlockResults) {
-      unlockMap[region] = unlockResult;
-    }
-    
-    // 阶段2：测速串行执行（避免带宽互相干扰）
-    for (const [region, data] of activeRegionEntries) {
-      const smartGroupName = data.smartGroup;
-      const nodeLatencies = regionLatencies[region];
-      const unlockResult = unlockMap[region];
+
+    // 4. 分层测试执行
+    const regionResults = {};
+
+    if (!CONFIG.DRY_RUN) {
+      // 对每地区 UCB1 Top-N 节点做逐节点精确测试
+      for (const [region, data] of activeRegionEntries) {
+        const targets = selectPreciseTestTargets(history, data.nodes, region, CONFIG.PRECISE_TEST_COUNT);
+        log("info", "Main", `${region} 精确测试目标`, { targets });
+        
+        const preciseResults = [];
+        for (const nodeName of targets) {
+          const result = await testSingleNode(nodeName, data.smartGroup, region);
+          // 补充 benchmark 延迟
+          result.latency = regionLatencies[region] ? regionLatencies[region][nodeName] || null : null;
+          preciseResults.push(result);
+        }
+        
+        // 4a. 非精确测试节点：使用精确测试的平均值作为地区信号
+        const avgSpeed = preciseResults.reduce((s, r) => s + r.speedBps, 0) / (preciseResults.length || 1);
+        const avgUnlock = preciseResults.reduce((s, r) => s + r.unlockScore, 0) / (preciseResults.length || 1);
+        const avgDetails = preciseResults.length > 0 ? preciseResults[0].unlockDetails : [];
+        
+        const otherNodes = data.nodes.filter(n => !targets.includes(n));
+        const otherResults = otherNodes.map(nodeName => ({
+          proxyName: nodeName,
+          region,
+          latency: regionLatencies[region] ? regionLatencies[region][nodeName] || null : null,
+          unlockScore: avgUnlock, // 使用地区平均值
+          unlockDetails: avgDetails,
+          speedBps: avgSpeed, // 使用地区平均值
+          speedElapsed: null
+        }));
+        
+        regionResults[region] = [...preciseResults, ...otherResults];
+        
+        // 更新历史
+        for (const result of regionResults[region]) {
+          updateNodeHistory(history, result);
+        }
+      }
       
-      // 地区级测速
-      const speedResult = await testRegionSpeed(region, smartGroupName);
-      log("info", "Speed", `${region} 测速`, speedResult ? { speedMbps: (speedResult.speedBps / 1048576).toFixed(2), elapsed: speedResult.elapsed.toFixed(1) } : { failed: true });
+      // 4b. 恢复 Smart 组（选择当前评分最高的节点）
+      for (const [region, data] of activeRegionEntries) {
+        try {
+          // 找到该地区评分最高的节点
+          let bestNode = "", bestScore = -1;
+          for (const name of data.nodes) {
+            const node = history.nodes[name];
+            if (node && node.score > bestScore) {
+              bestScore = node.score;
+              bestNode = name;
+            }
+          }
+          if (bestNode) {
+            await switchGroupPolicy(data.smartGroup, bestNode);
+            log("info", "Main", `${region} 恢复选择`, { node: bestNode, score: bestScore.toFixed(3) });
+          }
+        } catch (e) {
+          log("warn", "Main", `${region} 恢复选择失败`, { error: e.message });
+        }
+      }
+    } else {
+      // DRY_RUN 模式：使用原来的地区级测试（不切换节点）
+      // 解锁并行
+      const unlockResults = await Promise.all(
+        activeRegionEntries.map(async ([region, data]) => {
+          const unlockResult = await checkRegionUnlock(region, data.smartGroup);
+          return { region, unlockResult };
+        })
+      );
+      const unlockMap = {};
+      for (const { region, unlockResult } of unlockResults) {
+        unlockMap[region] = unlockResult;
+      }
       
-      // 为该地区每个节点生成结果（延迟逐节点，解锁/速度共享地区值）
-      regionResults[region] = data.nodes.map(nodeName => ({
-        proxyName: nodeName,
-        region,
-        latency: nodeLatencies[nodeName] || null,
-        unlockScore: unlockResult.unlockScore,
-        unlockDetails: unlockResult.details,
-        speedBps: speedResult ? speedResult.speedBps : 0,
-        speedElapsed: speedResult ? speedResult.elapsed : null
-      }));
-      
-      // 更新历史数据
-      for (const result of regionResults[region]) {
-        updateNodeHistory(history, result);
+      // 测速串行
+      for (const [region, data] of activeRegionEntries) {
+        const speedResult = await testRegionSpeed(region, data.smartGroup);
+        const unlockResult = unlockMap[region];
+        
+        regionResults[region] = data.nodes.map(nodeName => ({
+          proxyName: nodeName,
+          region,
+          latency: regionLatencies[region] ? regionLatencies[region][nodeName] || null : null,
+          unlockScore: unlockResult.unlockScore,
+          unlockDetails: unlockResult.details,
+          speedBps: speedResult ? speedResult.speedBps : 0,
+          speedElapsed: speedResult ? speedResult.elapsed : null
+        }));
+        
+        for (const result of regionResults[region]) {
+          updateNodeHistory(history, result);
+        }
       }
     }
     
@@ -1421,17 +1562,17 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
     const regionScores = {};
     for (const [region, data] of Object.entries(regionData)) {
       if (data.nodes.length === 0) continue;
-      const unlockResult = unlockMap[region];
       // 计算地区平均延迟
       const latencies = Object.values(regionLatencies[region] || {});
       const avgLatency = latencies.length > 0 ? latencies.reduce((a, b) => a + b, 0) / latencies.length : 999;
-      // 计算地区测速（从 regionResults 中获取）
-      const regionResult = regionResults[region];
-      const speedBps = (regionResult && regionResult.length > 0) ? regionResult[0].speedBps : 0;
-      const speedMbps = (speedBps * 8) / 1048576; // 转换为 Mbps
+      // 从 regionResults 中获取平均解锁和速度
+      const results = regionResults[region] || [];
+      const avgUnlock = results.length > 0 ? results.reduce((s, r) => s + r.unlockScore, 0) / results.length : 0;
+      const avgSpeedBps = results.length > 0 ? results.reduce((s, r) => s + r.speedBps, 0) / results.length : 0;
+      const speedMbps = (avgSpeedBps * 8) / 1048576; // 转换为 Mbps
       
       regionScores[region] = {
-        unlock: unlockResult ? unlockResult.unlockScore : 0,
+        unlock: avgUnlock,
         speedMbps: speedMbps,
         latencyMs: avgLatency
       };
@@ -1478,8 +1619,10 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
     const profileWithWeights = updateProfileWeights(profile, weightMap, networkSuffix, regionScores, networkType);
     // 8b. 对 Fallback 组做地区重排（传入各地区解锁详情，用于一票否决机制）
     const unlockDetails = {};
-    for (const { region, unlockResult } of unlockResults) {
-      unlockDetails[region] = unlockResult.details;
+    for (const [region, results] of Object.entries(regionResults)) {
+      if (results.length > 0 && results[0].unlockDetails) {
+        unlockDetails[region] = results[0].unlockDetails;
+      }
     }
     const updatedProfile = reorderFallbackGroups(profileWithWeights, regionScores, unlockDetails, minSpeedMbps, maxSpeedMbps);
     
