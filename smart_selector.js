@@ -29,7 +29,6 @@ const CONFIG = {
   CONCURRENCY: 3,
   SPEED_TIMEOUT: 10000,
   UNLOCK_TIMEOUT: 3000,
-  SPEED_FILE_SIZE: 1048576, // 1MB
   // 网络防抖配置
   DEBOUNCE_WINDOW: 2,          // 连续失败次数阈值，连续 N 次结果一致才更新评分
   OUTLIER_THRESHOLD: 2.0,      // 离群值检测倍数，偏差超过 N 倍标准差时降低更新权重
@@ -244,8 +243,13 @@ function detectNetworkType() {
     // 通过 primaryInterface 区分有线/蜂窝
     if ($network.v4 && $network.v4.primaryInterface) {
       const iface = $network.v4.primaryInterface;
-      // pdp_ip0 = Cellular on iOS, utun = VPN tunnel
-      if (iface.startsWith("pdp_ip") || iface.startsWith("utun")) {
+      // utun = VPN tunnel (macOS/iOS)，检查底层网络
+      if (iface.startsWith("utun")) {
+        if ($network.wifi) return "WiFi";  // VPN over WiFi
+        return "有线"; // VPN over Ethernet
+      }
+      // pdp_ip0 = Cellular on iOS
+      if (iface.startsWith("pdp_ip")) {
         return "移动";
       }
       // en0 = WiFi (already handled above if ssid exists)
@@ -275,22 +279,26 @@ const UNLOCK_TARGETS = {
   HK: [
     { name: "Netflix", url: "https://www.netflix.com/title/81280792", check: (status, body) => status === 200 || status === 301 },
     { name: "Disney+", url: "https://www.disneyplus.com/", check: (status, body) => status >= 200 && status < 400 },
-    { name: "Gemini", url: "https://gemini.google.com/", check: (status, body) => status >= 200 && status < 400 }
+    { name: "Gemini", url: "https://gemini.google.com/", check: (status, body) => status >= 200 && status < 400 },
+    { name: "ChatGPT", url: "https://ios.chat.openai.com/public-api/mobile/server_status/v1", check: (status, body) => status === 200 }
   ],
   TW: [
     { name: "Netflix", url: "https://www.netflix.com/title/81280792", check: (status, body) => status === 200 || status === 301 },
     { name: "Disney+", url: "https://www.disneyplus.com/", check: (status, body) => status >= 200 && status < 400 },
-    { name: "Gemini", url: "https://gemini.google.com/", check: (status, body) => status >= 200 && status < 400 }
+    { name: "Gemini", url: "https://gemini.google.com/", check: (status, body) => status >= 200 && status < 400 },
+    { name: "ChatGPT", url: "https://ios.chat.openai.com/public-api/mobile/server_status/v1", check: (status, body) => status === 200 }
   ],
   JP: [
     { name: "Netflix", url: "https://www.netflix.com/title/81280792", check: (status, body) => status === 200 || status === 301 },
     { name: "Disney+", url: "https://www.disneyplus.com/", check: (status, body) => status >= 200 && status < 400 },
-    { name: "Gemini", url: "https://gemini.google.com/", check: (status, body) => status >= 200 && status < 400 }
+    { name: "Gemini", url: "https://gemini.google.com/", check: (status, body) => status >= 200 && status < 400 },
+    { name: "ChatGPT", url: "https://ios.chat.openai.com/public-api/mobile/server_status/v1", check: (status, body) => status === 200 }
   ],
   SG: [
     { name: "Netflix", url: "https://www.netflix.com/title/81280792", check: (status, body) => status === 200 || status === 301 },
     { name: "Disney+", url: "https://www.disneyplus.com/", check: (status, body) => status >= 200 && status < 400 },
-    { name: "Gemini", url: "https://gemini.google.com/", check: (status, body) => status >= 200 && status < 400 }
+    { name: "Gemini", url: "https://gemini.google.com/", check: (status, body) => status >= 200 && status < 400 },
+    { name: "ChatGPT", url: "https://ios.chat.openai.com/public-api/mobile/server_status/v1", check: (status, body) => status === 200 }
   ],
   US: [
     { name: "Netflix", url: "https://www.netflix.com/title/81280792", check: (status, body) => status === 200 || status === 301 },
@@ -301,7 +309,8 @@ const UNLOCK_TARGETS = {
   KR: [
     { name: "Netflix", url: "https://www.netflix.com/title/81280792", check: (status, body) => status === 200 || status === 301 },
     { name: "Disney+", url: "https://www.disneyplus.com/", check: (status, body) => status >= 200 && status < 400 },
-    { name: "Gemini", url: "https://gemini.google.com/", check: (status, body) => status >= 200 && status < 400 }
+    { name: "Gemini", url: "https://gemini.google.com/", check: (status, body) => status >= 200 && status < 400 },
+    { name: "ChatGPT", url: "https://ios.chat.openai.com/public-api/mobile/server_status/v1", check: (status, body) => status === 200 }
   ]
 };
 
@@ -361,7 +370,7 @@ async function testRegionSpeed(region, smartGroupName) {
       timeout: CONFIG.SPEED_TIMEOUT,
       headers: { "User-Agent": "Mozilla/5.0 SpeedTest" }
     });
-    const elapsed = (Date.now() - startTime) / 1000;
+    const elapsed = Math.max((Date.now() - startTime) / 1000, 0.001); // 最低 1ms 防止除零
     const speedBps = testFile.size / elapsed;
     log("debug", "Speed", `${region} (${smartGroupName})`, { speedMbps: (speedBps * 8 / 1048576).toFixed(2), elapsed: elapsed.toFixed(2) });
     return { speedBps, elapsed };
@@ -447,6 +456,7 @@ function selectPreciseTestTargets(history, nodes, region, count) {
 
 // EMA（指数移动平均）- alpha 越大，新数据权重越高
 function updateEMA(oldEMA, newValue, alpha = 0.3) {
+  if (!Number.isFinite(newValue)) return oldEMA; // 拒绝 NaN/Infinity 污染
   if (oldEMA === null || oldEMA === undefined) return newValue;
   return alpha * newValue + (1 - alpha) * oldEMA;
 }
@@ -458,12 +468,6 @@ function getUnlockProbability(alpha, beta) {
 
 function updateBetaDistribution(alpha, beta, unlocked) {
   return unlocked ? { alpha: alpha + 1, beta } : { alpha, beta: beta + 1 };
-}
-
-// UCB1 (Upper Confidence Bound) - 探索与利用平衡
-function ucb1Score(nodeScore, totalRounds, nodeTests, C = 1.5) {
-  if (nodeTests === 0) return Infinity; // 未测试过的节点优先探索
-  return nodeScore + C * Math.sqrt(Math.log(totalRounds) / nodeTests);
 }
 
 // 时间衰减因子 - 数据越旧权重越低
@@ -626,6 +630,11 @@ function updateNodeHistory(history, result) {
       const categoryUnlocked = serviceNames.some(svc =>
         result.unlockDetails.some(d => d.name === svc && d.unlocked)
       );
+      
+      // 遗忘因子：衰减旧参数，让模型对解锁能力变化保持敏感
+      const BETA_DECAY = 0.99;
+      node.unlockByCategory[category].alpha *= BETA_DECAY;
+      node.unlockByCategory[category].beta *= BETA_DECAY;
       
       // 防抖逻辑仍适用
       if (categoryUnlocked) {
@@ -845,14 +854,12 @@ function insertOrUpdateComment(lines, targetIndex, comment) {
 function updateProfileWeights(profileText, weightMap, suffix, regionScores, networkType) {
   const lines = profileText.split("\n");
   let inProxyGroup = false;
-  let currentSection = "";
   
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
     
     // 检测 section 切换
     if (line.startsWith("[")) {
-      currentSection = line;
       inProxyGroup = (line === "[Proxy Group]");
       continue;
     }
@@ -1018,7 +1025,6 @@ function calcRegionScore(regionData, sortBy, minSpeedMbps, maxSpeedMbps) {
 function reorderFallbackGroups(profileText, regionScores, unlockDetails, minSpeedMbps, maxSpeedMbps) {
   const lines = profileText.split("\n");
   let inProxyGroup = false;
-  let currentSection = "";
   
   // 所有可能的地区简称
   const ALL_REGIONS = Object.keys(CONFIG.REGION_GROUPS);
@@ -1028,7 +1034,6 @@ function reorderFallbackGroups(profileText, regionScores, unlockDetails, minSpee
     
     // 检测 section 切换
     if (line.startsWith("[")) {
-      currentSection = line;
       inProxyGroup = (line === "[Proxy Group]");
       continue;
     }
@@ -1349,12 +1354,24 @@ async function downloadProfile() {
   return file.content;
 }
 
+// Profile 合法性校验（上传前防御）
+function validateProfile(text) {
+  const requiredSections = ['[General]', '[Proxy]', '[Proxy Group]', '[Rule]'];
+  for (const s of requiredSections) {
+    if (!text.includes(s)) throw new Error(`Profile 校验失败: 缺少 ${s}`);
+  }
+  const lineCount = text.split('\n').length;
+  if (lineCount < 50) throw new Error(`Profile 校验失败: 行数异常少 (${lineCount}行)，可能被截断`);
+  log("info", "Gist", "Profile 校验通过", { lines: lineCount });
+}
+
 // 上传更新后的 Profile 到 Gist（使用下载时自动发现的文件名）
 async function uploadProfile(content) {
   if (!_discoveredGistFilename) {
     throw new Error("未发现 Gist 文件名，请先执行 downloadProfile");
   }
   log("info", "Gist", "Profile 上传开始", { filename: _discoveredGistFilename });
+  validateProfile(content); // 上传前校验 Profile 合法性
   const resp = await httpPatch({
     url: `https://api.github.com/gists/${CONFIG.GIST_ID}`,
     headers: {
@@ -1425,6 +1442,15 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
   const startTime = Date.now();
   const panel = { title: "Smart 优选", content: "检测中...", icon: "bolt.horizontal.circle.fill", "icon-color": "#5AC8FA" };
   
+  // 运行锁：防止 cron 重叠触发导致并发竞争
+  const LOCK_KEY = "smart_selector_running";
+  if ($persistentStore.read(LOCK_KEY) === "true") {
+    log("warn", "Main", "上一轮仍在运行，跳过本轮");
+    $done({ title: "Smart 优选", content: "跳过：上一轮仍在运行", icon: "bolt.horizontal.circle.fill", "icon-color": "#FF9500" });
+  }
+  $persistentStore.write("true", LOCK_KEY);
+  
+  let originalTestGroupPolicy = null; // 提升到最外层，确保 catch/finally 都能访问
   try {
     // 验证配置
     if (!CONFIG.GITHUB_TOKEN) throw new Error("未配置 GitHub Token");
@@ -1436,52 +1462,31 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
     log("info", "Main", "Smart Selector 启动", { dryRun: CONFIG.DRY_RUN, network: networkType, suffix: networkSuffix });
     log("debug", "Main", "配置验证通过");
     
-    // ==================== API 端点探测（仅 DRY_RUN 模式，带缓存）====================
+    // ==================== API 端点探测（仅 DRY_RUN 模式）====================
     if (CONFIG.DRY_RUN) {
-      // 检查 probe 缓存是否有效（24小时过期）
-      const PROBE_CACHE_KEY = "smart_selector_probe_cache";
-      const PROBE_CACHE_TTL = 86400000; // 24小时
-      let probeCache = null;
-      try {
-        const raw = $persistentStore.read(PROBE_CACHE_KEY);
-        if (raw) probeCache = JSON.parse(raw);
-      } catch (e) { /* ignore */ }
+      log("info", "Probe", "开始 API 端点探测");
       
-      const probeCacheValid = probeCache && probeCache.timestamp && (Date.now() - probeCache.timestamp < PROBE_CACHE_TTL);
+      // 仅探测只读 GET 端点，排除会触发实际操作的 POST 端点
+      const endpoints = [
+        { method: "GET", path: "/v1/policy_groups" },
+        { method: "GET", path: "/v1/policies/benchmark_results" },
+        { method: "GET", path: "/v1/policies/detail?policy_name=HK-WiFi" },
+        { method: "GET", path: "/v1/policy_groups/select?group_name=HK-WiFi" },
+      ];
       
-      if (probeCacheValid) {
-        log("info", "Probe", "使用缓存的探测结果", { age: ((Date.now() - probeCache.timestamp) / 3600000).toFixed(1) + "h" });
-      } else {
-        log("info", "Probe", "开始 API 端点探测（首次或缓存已过期）");
-        
-        // 仅探测只读 GET 端点，排除会触发实际操作的 POST 端点
-        const endpoints = [
-          { method: "GET", path: "/v1/policy_groups" },
-          { method: "GET", path: "/v1/policies/benchmark_results" },
-          { method: "GET", path: "/v1/policies/detail?policy_name=HK-WiFi" },
-          { method: "GET", path: "/v1/policy_groups/select?group_name=HK-WiFi" },
-        ];
-        
-        const probeResults = {};
-        for (const ep of endpoints) {
-          try {
-            const result = await surgeAPI(ep.method, ep.path, ep.body || null);
-            const resultStr = JSON.stringify(result);
-            probeResults[`${ep.method} ${ep.path}`] = { ok: true, size: resultStr.length };
-            log("info", "Probe", `✅ ${ep.method} ${ep.path}`, { 
-              size: resultStr.length,
-              preview: resultStr.slice(0, 200)
-            });
-          } catch (e) {
-            probeResults[`${ep.method} ${ep.path}`] = { ok: false, error: e.message };
-            log("info", "Probe", `❌ ${ep.method} ${ep.path}`, { error: e.message });
-          }
+      for (const ep of endpoints) {
+        try {
+          const result = await surgeAPI(ep.method, ep.path, ep.body || null);
+          const resultStr = JSON.stringify(result);
+          log("info", "Probe", `✅ ${ep.method} ${ep.path}`, { 
+            size: resultStr.length,
+            preview: resultStr.slice(0, 200)
+          });
+        } catch (e) {
+          log("info", "Probe", `❌ ${ep.method} ${ep.path}`, { error: e.message });
         }
-        
-        // 缓存探测结果
-        $persistentStore.write(JSON.stringify({ timestamp: Date.now(), results: probeResults }), PROBE_CACHE_KEY);
-        log("info", "Probe", "API 端点探测完成，结果已缓存");
       }
+      log("info", "Probe", "API 端点探测完成");
     }
     
     // 1. 加载历史数据
@@ -1588,10 +1593,10 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
 
     // 4. 分层测试执行
     const regionResults = {};
-
+    
     if (!CONFIG.DRY_RUN) {
       // 记录测试组的原始选择，测试结束后恢复
-      let originalTestGroupPolicy = "DIRECT"; // 默认值
+      originalTestGroupPolicy = "DIRECT"; // 默认值
       try {
         const testGroupData = await surgeAPI("GET", `/v1/policy_groups/select?group_name=${encodeURIComponent(CONFIG.TEST_GROUP)}`);
         if (testGroupData && testGroupData.policy) {
@@ -1601,62 +1606,73 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
       } catch (e) {
         log("debug", "Main", "获取测试组原始选择失败，将恢复为DIRECT", { error: e.message });
       }
-
-      // 对每地区 UCB1 Top-N 节点做逐节点精确测试
-      for (const [region, data] of activeRegionEntries) {
-        const targets = selectPreciseTestTargets(history, data.nodes, region, CONFIG.PRECISE_TEST_COUNT);
-        if (targets.length === 0) {
-          log("info", "Main", `${region} 全部节点处于冷却期，跳过本轮`);
-          regionResults[region] = [];
-          continue;
+    
+      // 对每地区 UCB1 Top-N 节点做逐节点精确测试（try/finally 确保测试通道恢复）
+      try {
+        for (const [region, data] of activeRegionEntries) {
+          const targets = selectPreciseTestTargets(history, data.nodes, region, CONFIG.PRECISE_TEST_COUNT);
+          if (targets.length === 0) {
+            log("info", "Main", `${region} 全部节点处于冷却期，跳过本轮`);
+            regionResults[region] = [];
+            continue;
+          }
+          log("info", "Main", `${region} 精确测试目标`, { targets });
+              
+          const preciseResults = [];
+          for (const nodeName of targets) {
+            const result = await testSingleNode(nodeName, region);
+            // 补充 benchmark 延迟
+            result.latency = regionLatencies[region] ? regionLatencies[region][nodeName] || null : null;
+            preciseResults.push(result);
+          }
+              
+          // 4a. 非精确测试节点：使用精确测试的平均值作为地区信号
+          const avgSpeed = preciseResults.reduce((s, r) => s + r.speedBps, 0) / (preciseResults.length || 1);
+          const avgUnlock = preciseResults.reduce((s, r) => s + r.unlockScore, 0) / (preciseResults.length || 1);
+          const avgDetails = preciseResults.length > 0 ? preciseResults[0].unlockDetails : [];
+              
+          const otherNodes = data.nodes.filter(n => !targets.includes(n));
+          const otherResults = otherNodes.map(nodeName => ({
+            proxyName: nodeName,
+            region,
+            latency: regionLatencies[region] ? regionLatencies[region][nodeName] || null : null,
+            unlockScore: avgUnlock, // 使用地区平均值
+            unlockDetails: avgDetails,
+            speedBps: avgSpeed, // 使用地区平均值
+            speedElapsed: null
+          }));
+              
+          regionResults[region] = [...preciseResults, ...otherResults];
+              
+          // 更新历史
+          for (const result of regionResults[region]) {
+            updateNodeHistory(history, result);
+          }
         }
-        log("info", "Main", `${region} 精确测试目标`, { targets });
-        
-        const preciseResults = [];
-        for (const nodeName of targets) {
-          const result = await testSingleNode(nodeName, region);
-          // 补充 benchmark 延迟
-          result.latency = regionLatencies[region] ? regionLatencies[region][nodeName] || null : null;
-          preciseResults.push(result);
-        }
-        
-        // 4a. 非精确测试节点：使用精确测试的平均值作为地区信号
-        const avgSpeed = preciseResults.reduce((s, r) => s + r.speedBps, 0) / (preciseResults.length || 1);
-        const avgUnlock = preciseResults.reduce((s, r) => s + r.unlockScore, 0) / (preciseResults.length || 1);
-        const avgDetails = preciseResults.length > 0 ? preciseResults[0].unlockDetails : [];
-        
-        const otherNodes = data.nodes.filter(n => !targets.includes(n));
-        const otherResults = otherNodes.map(nodeName => ({
-          proxyName: nodeName,
-          region,
-          latency: regionLatencies[region] ? regionLatencies[region][nodeName] || null : null,
-          unlockScore: avgUnlock, // 使用地区平均值
-          unlockDetails: avgDetails,
-          speedBps: avgSpeed, // 使用地区平均值
-          speedElapsed: null
-        }));
-        
-        regionResults[region] = [...preciseResults, ...otherResults];
-        
-        // 更新历史
-        for (const result of regionResults[region]) {
-          updateNodeHistory(history, result);
-        }
-        
-        // 恢复"速度测试"组到原始选择（测试通道复位，不干预 Smart 组自动选择）
+      } finally {
+        // 循环结束后统一恢复“速度测试”组（try/finally 确保即使异常也能恢复）
         try {
           await switchGroupPolicy(CONFIG.TEST_GROUP, originalTestGroupPolicy);
-          log("info", "Main", `${region} 测试完成，测试通道已恢复`, { restored: originalTestGroupPolicy });
+          log("info", "Main", "测试通道已恢复", { restored: originalTestGroupPolicy });
         } catch (e) {
-          log("warn", "Main", `${region} 测试通道恢复失败`, { error: e.message });
+          log("warn", "Main", "测试通道恢复失败", { error: e.message });
         }
       }
     } else {
-      // DRY_RUN 模式：使用原来的地区级测试（不切换节点）
-      // 解锁并行
+      // DRY_RUN 模式：通过 TEST_GROUP 路由测试流量（不影响活跃 Smart 组）
+      // 记录测试组原始选择
+      originalTestGroupPolicy = "DIRECT";
+      try {
+        const testGroupData = await surgeAPI("GET", `/v1/policy_groups/select?group_name=${encodeURIComponent(CONFIG.TEST_GROUP)}`);
+        if (testGroupData && testGroupData.policy) {
+          originalTestGroupPolicy = testGroupData.policy;
+        }
+      } catch (e) { /* ignore */ }
+    
+      // 解锁并行（通过 TEST_GROUP 路由，不影响活跃 Smart 组）
       const unlockResults = await Promise.all(
         activeRegionEntries.map(async ([region, data]) => {
-          const unlockResult = await checkRegionUnlock(region, data.smartGroup);
+          const unlockResult = await checkRegionUnlock(region, CONFIG.TEST_GROUP);
           return { region, unlockResult };
         })
       );
@@ -1664,12 +1680,12 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
       for (const { region, unlockResult } of unlockResults) {
         unlockMap[region] = unlockResult;
       }
-      
+          
       // 测速串行
       for (const [region, data] of activeRegionEntries) {
-        const speedResult = await testRegionSpeed(region, data.smartGroup);
+        const speedResult = await testRegionSpeed(region, CONFIG.TEST_GROUP);
         const unlockResult = unlockMap[region];
-        
+            
         regionResults[region] = data.nodes.map(nodeName => ({
           proxyName: nodeName,
           region,
@@ -1679,11 +1695,16 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
           speedBps: speedResult ? speedResult.speedBps : 0,
           speedElapsed: speedResult ? speedResult.elapsed : null
         }));
-        
+            
         for (const result of regionResults[region]) {
           updateNodeHistory(history, result);
         }
       }
+    
+      // 恢复测试组
+      try {
+        await switchGroupPolicy(CONFIG.TEST_GROUP, originalTestGroupPolicy);
+      } catch (e) { /* ignore */ }
     }
     
     
@@ -1844,6 +1865,13 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
     panel["icon-color"] = "#FF3B30";
     log("error", "Main", "Smart Selector 失败", { error: e.message || String(e), duration });
     $notification.post("Smart优选失败", "", e.message || e);
+    // 异常时恢复测试组（防止测试组停留在测试节点）
+    if (originalTestGroupPolicy) {
+      try { await switchGroupPolicy(CONFIG.TEST_GROUP, originalTestGroupPolicy); } catch (_) {}
+    }
+  } finally {
+    // 无论如何都释放运行锁
+    $persistentStore.write("false", LOCK_KEY);
   }
   
   $done(panel);
