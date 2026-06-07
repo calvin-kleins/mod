@@ -216,6 +216,21 @@ function mapBenchmarkToNodes(benchmarkData, hashMap) {
   return latencyMap;
 }
 
+// 从 benchmark 数据提取 UDP 转发能力（proxy-test-udp 测试结果）
+// 支持 Surge 多种可能的字段名，兼容不同版本
+function mapBenchmarkUDP(benchmarkData, hashMap) {
+  const udpMap = {};
+  for (const [nodeName, hash] of Object.entries(hashMap)) {
+    const result = benchmarkData[hash];
+    if (!result) continue;
+    const udpValue = result.lastTestWithUDPInMS ?? result.udpTestScoreInMS ?? result.lastUDPTestScoreInMS;
+    if (typeof udpValue === 'number' && udpValue > 0) {
+      udpMap[nodeName] = true;
+    }
+  }
+  return udpMap;
+}
+
 // ==================== 网络类型检测 ==
 
 // 检测当前设备网络连接类型
@@ -546,7 +561,9 @@ function initNodeHistory(history, name, regional) {
     consecutiveFailures: 0,    // 连续失败计数
     lastSpeedVariance: 0,      // 速度方差（用于离群检测）
     // 冷却期字段
-    cooldownUntil: 0           // 冷却结束时间戳，0 表示不在冷却中
+    cooldownUntil: 0,           // 冷却结束时间戳，0 表示不在冷却中
+    // UDP 转发能力（从 proxy-test-udp benchmark 检测）
+    udpCapable: false
   };
 }
 
@@ -888,6 +905,73 @@ function updateProfileWeights(profileText, weightMap, suffix, regionScores, netw
   return lines.join("\n");
 }
 
+// ==================== UDP 组 policy-regex-filter 更新 ====================
+
+// UDP 专用 Smart 组名映射（地区 → UDP 组名）
+const UDP_GROUPS = { HK: "HK-UDP", SG: "SG-UDP", JP: "JP-UDP", KR: "KR-UDP" };
+
+// 为 UDP Smart 组动态生成 policy-regex-filter（仅纳入 UDP 转发能力节点）
+// 这才是真正的一票否决：不支持 UDP 的节点直接从组里排除
+function updateUDPGroupFilters(profileText, regionUDPCapable) {
+  const lines = profileText.split("\n");
+  let inProxyGroup = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (line.startsWith("[")) {
+      inProxyGroup = (line === "[Proxy Group]");
+      continue;
+    }
+    if (!inProxyGroup || !line || line.startsWith("#")) continue;
+    if (!/=\s*smart\b/i.test(line)) continue;
+
+    // 提取组名
+    const nameMatch = line.match(/^\s*([^=]+?)\s*=/);
+    if (!nameMatch) continue;
+    const groupName = nameMatch[1].trim();
+
+    // 检查是否是 UDP 组
+    let udpRegion = null;
+    for (const [region, udpName] of Object.entries(UDP_GROUPS)) {
+      if (groupName === udpName) { udpRegion = region; break; }
+    }
+    if (!udpRegion) continue;
+
+    // 获取该地区 UDP 能力节点名单
+    const udpMap = regionUDPCapable[udpRegion];
+    if (!udpMap) continue;
+    const udpNodes = Object.entries(udpMap).filter(([_, v]) => v).map(([name]) => name);
+
+    if (udpNodes.length === 0) {
+      log("info", "UDP", `${groupName} 无 UDP 节点，保持默认 filter`);
+      continue;
+    }
+
+    // 构建 policy-regex-filter（精确匹配节点名，转义正则特殊字符）
+    const escapedNames = udpNodes.map(n => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    const regexFilter = escapedNames.map(n => `(${n})`).join("|");
+    const filterValue = `policy-regex-filter="${regexFilter}"`;
+
+    // 替换或插入 policy-regex-filter
+    if (/policy-regex-filter\s*=\s*"[^"]*"/.test(lines[i])) {
+      lines[i] = lines[i].replace(/policy-regex-filter\s*=\s*"[^"]*"/, filterValue);
+    } else {
+      const commentIdx = findCommentIndex(lines[i]);
+      if (commentIdx > 0) {
+        const configPart = lines[i].substring(0, commentIdx).trimEnd();
+        const commentPart = lines[i].substring(commentIdx);
+        lines[i] = `${configPart}, ${filterValue} ${commentPart}`;
+      } else {
+        lines[i] = lines[i].trimEnd() + `, ${filterValue}`;
+      }
+    }
+
+    log("info", "UDP", `${groupName} filter 已更新`, { nodes: udpNodes.length, sample: udpNodes.slice(0, 3) });
+  }
+
+  return lines.join("\n");
+}
+
 // ==================== Fallback 地区排序模块 ====================
 
 // Fallback 组重排配置
@@ -897,7 +981,8 @@ const FALLBACK_REORDER_CONFIG = {
   "Netflix容灾": { exclude: [], sortBy: "overall", requiredUnlock: ["Netflix"] },
   "流媒体容灾": { exclude: [], sortBy: "overall" },
   "AIGC容灾": { exclude: ["HK"], sortBy: "overall", requiredUnlock: ["Gemini", "ChatGPT"] },
-  "游戏容灾": { exclude: ["US", "TW"], sortBy: "latency", suffix: ["DIRECT"] },
+  "游戏容灾": { exclude: ["US", "TW"], sortBy: "latency", udpSuffix: true, suffix: ["DIRECT"] },
+  "漏网之鱼容灾": { exclude: ["US", "TW"], sortBy: "latency", udpSuffix: true, suffix: ["代理容灾"] },
   "TG容灾": { exclude: [], sortBy: "overall" },
   "Apple容灾": { regions: ["HK", "US", "JP", "KR"], sortBy: "overall" },
 };
@@ -983,7 +1068,7 @@ function reorderFallbackGroups(profileText, regionScores, unlockDetails, minSpee
     // 分离成员和参数
     const members = [];
     const params = [];
-    const paramPattern = /^(url|interval|timeout|evaluate-before-use|hidden|icon-url|no-alert|policy-regex-filter)\s*=/;
+    const paramPattern = /^(url|interval|timeout|evaluate-before-use|hidden|icon-url|no-alert|persistent|include-all-proxies|test-timeout|policy-regex-filter|policy-priority|external-policy-modifier)\s*=/;
     
     for (let j = 1; j < parts.length; j++) {
       if (paramPattern.test(parts[j])) {
@@ -1000,6 +1085,14 @@ function reorderFallbackGroups(profileText, regionScores, unlockDetails, minSpee
     for (const m of members) {
       if (ALL_REGIONS.includes(m)) {
         regionMembers.push(m);
+      } else if (config.udpSuffix) {
+        // 识别 XX-UDP 格式的组名（如 HK-UDP → 基础地区 HK）
+        const udpMatch = m.match(/^([A-Z]{2})-UDP$/);
+        if (udpMatch && ALL_REGIONS.includes(udpMatch[1])) {
+          regionMembers.push(udpMatch[1]); // 存储基础地区名用于排序
+        } else {
+          specialMembers.push(m);
+        }
       } else {
         specialMembers.push(m);
       }
@@ -1012,7 +1105,10 @@ function reorderFallbackGroups(profileText, regionScores, unlockDetails, minSpee
       sortableRegions = config.regions.filter(r => regionMembers.includes(r));
     } else {
       // 从当前成员中排除 exclude
-      sortableRegions = regionMembers.filter(r => !config.exclude.includes(r));
+      sortableRegions = regionMembers.filter(r => {
+        const baseRegion = r.replace(/-UDP$/, '');
+        return !config.exclude.includes(r) && !config.exclude.includes(baseRegion);
+      });
     }
     
     // 解锁一票否决：如果配置了 requiredUnlock，分为通过/未通过两组
@@ -1020,20 +1116,13 @@ function reorderFallbackGroups(profileText, regionScores, unlockDetails, minSpee
     if (config.requiredUnlock && config.requiredUnlock.length > 0 && unlockDetails) {
       const passed = [];
       failed = [];
-      
       for (const region of sortableRegions) {
-        const details = unlockDetails[region]; // [{name: "Netflix", unlocked: true}, ...]
-        // 检查是否有任一 required 服务解锁（OR 逻辑）
+        const details = unlockDetails[region];
         const hasRequired = config.requiredUnlock.some(serviceName =>
           details && details.some(d => d.name === serviceName && d.unlocked)
         );
-        if (hasRequired) {
-          passed.push(region);
-        } else {
-          failed.push(region);
-        }
+        hasRequired ? passed.push(region) : failed.push(region);
       }
-      
       // 分别按分数排序，未通过的放后面
       passed.sort((a, b) => {
         const scoreA = regionScores[a] ? calcRegionScore(regionScores[a], config.sortBy, minSpeedMbps, maxSpeedMbps) : 0;
@@ -1045,9 +1134,7 @@ function reorderFallbackGroups(profileText, regionScores, unlockDetails, minSpee
         const scoreB = regionScores[b] ? calcRegionScore(regionScores[b], config.sortBy, minSpeedMbps, maxSpeedMbps) : 0;
         return scoreB - scoreA;
       });
-      
       sortableRegions = [...passed, ...failed];
-      
       if (failed.length > 0) {
         log("info", "Fallback", `${groupName} 解锁否决`, { passed, failed, required: config.requiredUnlock });
       }
@@ -1060,9 +1147,20 @@ function reorderFallbackGroups(profileText, regionScores, unlockDetails, minSpee
       });
     }
     
+    // 无可排序地区时跳过，避免破坏已有的行内容和注释
+    if (sortableRegions.length === 0) {
+      log("debug", "Fallback", `${groupName} 无可排序地区，跳过`);
+      continue;
+    }
+
     // 重组成员列表
     // 被 exclude 的地区不参与，也不保留在结果中
     let newMembers = [...sortableRegions];
+    
+    // UDP 后缀模式：将基础地区名转换为 XX-UDP 组名
+    if (config.udpSuffix) {
+      newMembers = newMembers.map(r => `${r}-UDP`);
+    }
     
     // 添加特殊后缀
     if (config.suffix) {
@@ -1452,15 +1550,38 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
     }
     log("info", "Main", "Benchmark 数据刷新完成", { entries: Object.keys(benchmarkData).length });
 
+    // 诊断：输出 benchmark 数据的字段结构（帮助发现 UDP 相关字段）
+    if (CONFIG.DRY_RUN && Object.keys(benchmarkData).length > 0) {
+      const sampleHash = Object.keys(benchmarkData)[0];
+      const sampleData = benchmarkData[sampleHash];
+      if (sampleData && typeof sampleData === 'object') {
+        const fields = Object.entries(sampleData)
+          .filter(([_, v]) => typeof v === 'number')
+          .map(([k, v]) => `${k}:${v}`);
+        log("info", "Diag", "Benchmark 数值字段", { hash: sampleHash, fields: fields.join(", ") });
+      }
+    }
+
     // 映射延迟到节点
     const regionLatencies = {};
+    // 映射 UDP 转发能力到节点（按地区）
+    const regionUDPCapable = {};
     for (const [region, data] of Object.entries(regionData)) {
       if (data.nodes.length === 0) continue;
       regionLatencies[region] = mapBenchmarkToNodes(benchmarkData, data.hashMap);
+      // UDP 能力检测（proxy-test-udp 测试结果）
+      const udpData = mapBenchmarkUDP(benchmarkData, data.hashMap);
+      regionUDPCapable[region] = udpData;
       // 更新 EMA 延迟
       for (const [name, lat] of Object.entries(regionLatencies[region])) {
         if (history.nodes[name]) {
           history.nodes[name].emaLatency = updateEMA(history.nodes[name].emaLatency, lat);
+        }
+      }
+      // 独立循环：仅在有正向 UDP 测试结果时更新，不因数据缺失覆写已知状态
+      for (const name of data.nodes) {
+        if (history.nodes[name] && udpData[name]) {
+          history.nodes[name].udpCapable = true;
         }
       }
     }
@@ -1589,7 +1710,7 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
       regionScores[region] = {
         unlock: avgUnlock,
         speedMbps: speedMbps,
-        latencyMs: avgLatency
+        latencyMs: avgLatency,
       };
     }
     // 计算本轮 min/max
@@ -1632,6 +1753,8 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
     const profile = await downloadProfile();
     // 8a. 更新 Smart 组的 policy-priority（只更新当前网络类型的 Smart 组）
     const profileWithWeights = updateProfileWeights(profile, weightMap, networkSuffix, regionScores, networkType);
+    // 8a2. 更新 UDP Smart 组的 policy-regex-filter（仅纳入 UDP 转发能力节点）
+    const profileWithUDP = updateUDPGroupFilters(profileWithWeights, regionUDPCapable);
     // 8b. 对 Fallback 组做地区重排（传入各地区解锁详情，用于一票否决机制）
     const unlockDetails = {};
     for (const [region, results] of Object.entries(regionResults)) {
@@ -1639,7 +1762,7 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
         unlockDetails[region] = results[0].unlockDetails;
       }
     }
-    const updatedProfile = reorderFallbackGroups(profileWithWeights, regionScores, unlockDetails, minSpeedMbps, maxSpeedMbps);
+    const updatedProfile = reorderFallbackGroups(profileWithUDP, regionScores, unlockDetails, minSpeedMbps, maxSpeedMbps);
     
     // 8c. 先更新轮次和首次时间（摘要需要读取这些值）
     if (!history.firstRun) {
