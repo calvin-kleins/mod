@@ -279,37 +279,73 @@ const UNLOCK_TARGETS = {
   HK: [
     { name: "Netflix", url: "https://www.netflix.com/title/81280792", check: (status, body) => status === 200 || status === 301 },
     { name: "Disney+", url: "https://www.disneyplus.com/", check: (status, body) => status >= 200 && status < 400 },
-    { name: "Gemini", url: "https://gemini.google.com/", check: (status, body) => status >= 200 && status < 400 },
+    { name: "Gemini", url: "https://gemini.google.com/app", check: (status, body) => {
+      if (status !== 200) return false;
+      // Google 首页对所有地区返回 200，但 app 页在封锁地区会包含 region-block 提示
+      const b = (body || "").toLowerCase();
+      const blocked = ["not available in your", "not available in your region", "not available in your country", "not supported in your", "not yet available in"]; 
+      return !blocked.some(p => b.includes(p));
+    } },
     { name: "ChatGPT", url: "https://ios.chat.openai.com/public-api/mobile/server_status/v1", check: (status, body) => status === 200 }
   ],
   TW: [
     { name: "Netflix", url: "https://www.netflix.com/title/81280792", check: (status, body) => status === 200 || status === 301 },
     { name: "Disney+", url: "https://www.disneyplus.com/", check: (status, body) => status >= 200 && status < 400 },
-    { name: "Gemini", url: "https://gemini.google.com/", check: (status, body) => status >= 200 && status < 400 },
+    { name: "Gemini", url: "https://gemini.google.com/app", check: (status, body) => {
+      if (status !== 200) return false;
+      // Google 首页对所有地区返回 200，但 app 页在封锁地区会包含 region-block 提示
+      const b = (body || "").toLowerCase();
+      const blocked = ["not available in your", "not available in your region", "not available in your country", "not supported in your", "not yet available in"]; 
+      return !blocked.some(p => b.includes(p));
+    } },
     { name: "ChatGPT", url: "https://ios.chat.openai.com/public-api/mobile/server_status/v1", check: (status, body) => status === 200 }
   ],
   JP: [
     { name: "Netflix", url: "https://www.netflix.com/title/81280792", check: (status, body) => status === 200 || status === 301 },
     { name: "Disney+", url: "https://www.disneyplus.com/", check: (status, body) => status >= 200 && status < 400 },
-    { name: "Gemini", url: "https://gemini.google.com/", check: (status, body) => status >= 200 && status < 400 },
+    { name: "Gemini", url: "https://gemini.google.com/app", check: (status, body) => {
+      if (status !== 200) return false;
+      // Google 首页对所有地区返回 200，但 app 页在封锁地区会包含 region-block 提示
+      const b = (body || "").toLowerCase();
+      const blocked = ["not available in your", "not available in your region", "not available in your country", "not supported in your", "not yet available in"]; 
+      return !blocked.some(p => b.includes(p));
+    } },
     { name: "ChatGPT", url: "https://ios.chat.openai.com/public-api/mobile/server_status/v1", check: (status, body) => status === 200 }
   ],
   SG: [
     { name: "Netflix", url: "https://www.netflix.com/title/81280792", check: (status, body) => status === 200 || status === 301 },
     { name: "Disney+", url: "https://www.disneyplus.com/", check: (status, body) => status >= 200 && status < 400 },
-    { name: "Gemini", url: "https://gemini.google.com/", check: (status, body) => status >= 200 && status < 400 },
+    { name: "Gemini", url: "https://gemini.google.com/app", check: (status, body) => {
+      if (status !== 200) return false;
+      // Google 首页对所有地区返回 200，但 app 页在封锁地区会包含 region-block 提示
+      const b = (body || "").toLowerCase();
+      const blocked = ["not available in your", "not available in your region", "not available in your country", "not supported in your", "not yet available in"]; 
+      return !blocked.some(p => b.includes(p));
+    } },
     { name: "ChatGPT", url: "https://ios.chat.openai.com/public-api/mobile/server_status/v1", check: (status, body) => status === 200 }
   ],
   US: [
     { name: "Netflix", url: "https://www.netflix.com/title/81280792", check: (status, body) => status === 200 || status === 301 },
     { name: "Disney+", url: "https://www.disneyplus.com/", check: (status, body) => status >= 200 && status < 400 },
-    { name: "Gemini", url: "https://gemini.google.com/", check: (status, body) => status >= 200 && status < 400 },
+    { name: "Gemini", url: "https://gemini.google.com/app", check: (status, body) => {
+      if (status !== 200) return false;
+      // Google 首页对所有地区返回 200，但 app 页在封锁地区会包含 region-block 提示
+      const b = (body || "").toLowerCase();
+      const blocked = ["not available in your", "not available in your region", "not available in your country", "not supported in your", "not yet available in"]; 
+      return !blocked.some(p => b.includes(p));
+    } },
     { name: "ChatGPT", url: "https://ios.chat.openai.com/public-api/mobile/server_status/v1", check: (status, body) => status === 200 }
   ],
   KR: [
     { name: "Netflix", url: "https://www.netflix.com/title/81280792", check: (status, body) => status === 200 || status === 301 },
     { name: "Disney+", url: "https://www.disneyplus.com/", check: (status, body) => status >= 200 && status < 400 },
-    { name: "Gemini", url: "https://gemini.google.com/", check: (status, body) => status >= 200 && status < 400 },
+    { name: "Gemini", url: "https://gemini.google.com/app", check: (status, body) => {
+      if (status !== 200) return false;
+      // Google 首页对所有地区返回 200，但 app 页在封锁地区会包含 region-block 提示
+      const b = (body || "").toLowerCase();
+      const blocked = ["not available in your", "not available in your region", "not available in your country", "not supported in your", "not yet available in"]; 
+      return !blocked.some(p => b.includes(p));
+    } },
     { name: "ChatGPT", url: "https://ios.chat.openai.com/public-api/mobile/server_status/v1", check: (status, body) => status === 200 }
   ]
 };
@@ -481,11 +517,11 @@ function timeDecayFactor(lastTestTime, halfLifeMs = 86400000) { // 默认半衰�
 function calculateNodeScore(node) {
   const decay = timeDecayFactor(node.lastTestTime);
   
-  // 速率分 (归一化到 0-1，假设 10MB/s 为满分)
-  const speedScore = Math.min((node.emaSpeed || 0) / 10485760, 1.0);
+  // 速率分 (归一化到 0-1，以 5MB/s 为满分，更贴近代理实际吞吐)
+  const speedScore = Math.min((node.emaSpeed || 0) / 5242880, 1.0);
   
-  // 延迟分 (越低越好，映射到 0-1)
-  const latencyScore = node.emaLatency ? Math.max(1 - node.emaLatency / 500, 0) : 0.5;
+  // 延迟分 (越低越好，250ms 为下限，更贴近实际体感差异)
+  const latencyScore = node.emaLatency ? Math.max(1 - node.emaLatency / 250, 0) : 0.5;
   
   // 解锁概率
   const unlockProb = getUnlockProbability(node.unlockAlpha || 1, node.unlockBeta || 1);
@@ -496,9 +532,8 @@ function calculateNodeScore(node) {
                    : unlockProb > 0.1 ? 0.5   // 解锁不稳定 → 轻微惩罚
                    : 0.1;                      // 基本不解锁 → 重惩罚
 
-  // 速率和延迟的质量分
-  // 带宽为王：速度占 70%，延迟占 30%
-  const qualityScore = speedScore * 0.7 + latencyScore * 0.3;
+  // 延迟为王：延迟占 65%（决定浏览/流媒体/P2P 体感），速度占 35%（大文件另说）
+  const qualityScore = speedScore * 0.35 + latencyScore * 0.65;
 
   // 最终评分 = 门控 × 质量分
   const raw = unlockGate * qualityScore;
@@ -1442,13 +1477,16 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
   const startTime = Date.now();
   const panel = { title: "Smart 优选", content: "检测中...", icon: "bolt.horizontal.circle.fill", "icon-color": "#5AC8FA" };
   
-  // 运行锁：防止 cron 重叠触发导致并发竞争
+  // 运行锁：防止 cron 重叠触发导致并发竞争（时间戳防呆，10分钟无心跳视为死锁）
   const LOCK_KEY = "smart_selector_running";
-  if ($persistentStore.read(LOCK_KEY) === "true") {
-    log("warn", "Main", "上一轮仍在运行，跳过本轮");
+  const LOCK_STALE_MS = 600000; // 10 分钟
+  const lockVal = $persistentStore.read(LOCK_KEY);
+  const lockTs = lockVal ? Number(lockVal) : 0;
+  if (lockTs && (Date.now() - lockTs) < LOCK_STALE_MS) {
+    log("warn", "Main", "上一轮仍在运行，跳过本轮", { elapsed: Math.round((Date.now() - lockTs) / 1000) + "s" });
     $done({ title: "Smart 优选", content: "跳过：上一轮仍在运行", icon: "bolt.horizontal.circle.fill", "icon-color": "#FF9500" });
   }
-  $persistentStore.write("true", LOCK_KEY);
+  $persistentStore.write(String(Date.now()), LOCK_KEY);
   
   let originalTestGroupPolicy = null; // 提升到最外层，确保 catch/finally 都能访问
   try {
@@ -1871,7 +1909,7 @@ function formatPanelOutput(weightMap, duration, isColdStart, runCount, cooldownC
     }
   } finally {
     // 无论如何都释放运行锁
-    $persistentStore.write("false", LOCK_KEY);
+    $persistentStore.write("0", LOCK_KEY);
   }
   
   $done(panel);
