@@ -766,7 +766,7 @@ function generateWeightsFromModel(history, regional, currentNetworkType) {
         // 流量倍率微弱参考：仅作轻微调节，不主导权重
         // 0.1x节点→0.9（微弱提优），2x节点→1.1（微弱降优）
         const rawMultiplier = parseMultiplier(name);
-        const multiplier = clamp(rawMultiplier, 0.9, 1.1);
+        const multiplier = clamp(rawMultiplier, 0.99, 1.01);
         weight = weight * multiplier;
         if (multiplier > 1) {
           log("debug", "ML", "流量倍率惩罚", { node: name, multiplier, weight: weight.toFixed(2) });
